@@ -574,3 +574,42 @@ CLOSE_WAIT sockets on multi-GB repos; (b) for any upload >10 GB, drive
 it from an interactive terminal where the user can Ctrl-C; (c) tee with
 `set -euo pipefail` does NOT propagate through outer pipelines — use
 `> log.txt 2>&1` for background uploads instead.
+
+## L21. `swift test` doesn't bundle `default.metallib`; use `xcodebuild test` instead `[toolkit candidate]`
+
+**Where this bites:** any mlx-swift-based port. `swift test` from the CLI
+on macOS crashes on the FIRST MLX op dispatch with:
+
+```
+MLX error: Failed to load the default metallib. library not found
+  at .../mlx-swift/Source/Cmlx/mlx-c/mlx/c/stream.cpp:106
+```
+
+The crash is in `stream.cpp:106` during default-stream lookup — it fires
+even if you immediately call `Device.setDefault(device: .cpu)` because
+that call itself triggers the stream lookup. `MLXRandom.normal` /
+`MLXArray.zeros` of any non-trivial shape will also blow up.
+
+Root cause: `Cmlx` declares the Metal shaders as Swift Package resources
+(`.process` rule producing `default.metallib`), but SwiftPM's CLI test
+runner on macOS doesn't run the metallib compile pass that Xcode's build
+system does. The metallib doesn't exist on disk after `swift test`'s
+build phase, so it can't be loaded.
+
+**Fix:** invoke tests via xcodebuild instead.
+
+```bash
+xcodebuild test \
+    -scheme <Package>-Package \
+    -destination "platform=macOS"
+```
+
+This builds the metallib correctly and runs the same XCTest binaries.
+24-test run took 1.4 s wall clock in our case — comparable to `swift test`
+when it works.
+
+**Skill update target:** `common-pitfalls.md` — add a "Swift port quirks"
+section with this + the swift-transformers Hub-target-not-exposed
+quirk from L19's surrounding context. Recommend Swift ports document
+this in the top-level README so external contributors don't lose 30
+minutes to "why are my tests crashing on the first kernel call."
