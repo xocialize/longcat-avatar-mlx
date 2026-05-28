@@ -1,0 +1,6 @@
+tests: update REPO_ROOT/notes/ paths to docs/development/notes/
+
+Follow-up to the public repo reorganization. All 70 smoke + keymap tests
+continue to pass; parity tests still gated on opt-in weight downloads.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Reference checkouts (cloned external repos used during development)
+refs/
+
+# Generated inference outputs (per-run artifacts)
+scripts/output_*.mp4
+scripts/output_*.npy
+scripts/output_*.png
+
+# Conversion outputs (multi-GB weight bundles never belong in the source repo)
+*.safetensors
+*.safetensors.index.json
+
+# Cache + logs
+*.log
+.cache/

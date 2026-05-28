@@ -1,0 +1,3 @@
+0000000000000000000000000000000000000000 5db4aa233821ddebfb05bab5363c367f34ccb1fd xocialize <dustin.nielson@gmail.com> 1779977472 -0400	commit (initial): Initial public release — longcat-avatar-mlx v0.1.0
+5db4aa233821ddebfb05bab5363c367f34ccb1fd d5ce3037bc8d882f00168a743fa4998a1022298e xocialize <dustin.nielson@gmail.com> 1779977513 -0400	commit: scripts: add publish_hf.sh for staged mlx-community upload
+d5ce3037bc8d882f00168a743fa4998a1022298e c24e9c65c448b0f949f53b76edad0a2bf60246ac xocialize <dustin.nielson@gmail.com> 1779977564 -0400	commit: tests: update REPO_ROOT/notes/ paths to docs/development/notes/

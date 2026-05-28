@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "longcat-video-avatar-mlx"
+version = "0.1.0.dev0"
+description = "Apple MLX port of LongCat-Video-Avatar-1.5 (audio-driven video diffusion)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "MVS Collective" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mlx>=0.31.0",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.34",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# PyTorch is a DEV-ONLY dep for parity tests. End users running on MLX never need it.
+parity = [
+    "torch>=2.2",
+    "transformers>=4.48",
+    "diffusers>=0.33",
+    "einops>=0.8",
+]
+dev = [
+    "longcat-video-avatar-mlx[parity]",
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/mvs-collective/longcat-avatar-mlx"
+Reference = "https://github.com/meituan-longcat/LongCat-Video"
+
+[tool.setuptools]
+packages = ["longcat_video_avatar", "longcat_video_avatar.models", "longcat_video_avatar.utils"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
