@@ -613,3 +613,69 @@ section with this + the swift-transformers Hub-target-not-exposed
 quirk from L19's surrounding context. Recommend Swift ports document
 this in the top-level README so external contributors don't lose 30
 minutes to "why are my tests crashing on the first kernel call."
+
+## L22. bf16 GPU matmul kernels diverge between Python-MLX and Swift-MLX at large dims `[toolkit candidate]`
+
+**Where this bites:** any Swift port of a Python-MLX module with deep
+bf16 attention stacks. Discovered porting umT5-XXL (24 blocks ×
+`d_model=4096`).
+
+**Symptom:** the Swift port loads the same bf16 safetensors weights as
+Python, builds the same module hierarchy, gets identical input
+embeddings and norm outputs (0.0 max_abs through token_embedding,
+relative position bias, RMSNorm — all bit-identical). But the FIRST bf16
+`Linear(4096, 4096)` projection (Q in self-attention) diverges by
+~1e-3 (= one bf16 ULP at the relevant magnitudes) between Python-MLX
+and Swift-MLX, with identical inputs and identical bf16 weights.
+
+```
+[diag] block0.attn.q.weight diff: 0.0           ← weights identical
+[diag] norm1(x) diff:            0.0           ← input to q identical
+[diag] q(norm1(x)) diff:         9.77e-4       ← divergence starts HERE
+```
+
+Per-block amplification through 24 attention-then-FFN layers is ~3×, so
+the noise compounds to a max_abs of ~2048 by block 24, which the final
+RMSNorm clamps back to ~0.12 vs a final output ranging ±1.75 (~7%
+relative error).
+
+The same machine running Python's `mx` and Swift's `MLX` (both compiled
+from the same upstream C++ `mlx` core) produces deterministically
+different bf16 matmul outputs at `(1, 16, 4096) @ (4096, 4096) → bf16`.
+First few elements match (0.052734375 vs 0.05273438 — bf16-rounded
+identical). The divergence is at scattered positions deep in the array,
+consistent with single-ULP rounding differences from kernel-level
+detail (thread/group config, accumulator layout, MPS vs custom kernel,
+…) — NOT a semantic difference.
+
+**What we tried:**
+- Casting Linear inputs to fp32 on the CPU stream: only halved the
+  divergence (1e-3 → 5e-4). Not eliminated.
+- Casting the entire T5Attention path to fp32 (q/k/v Linears, QK^T,
+  softmax, attn@v, o): final divergence 0.119 → 0.072. Some improvement
+  but still substantial — divergence accumulates elsewhere too (FFN
+  Linears, possibly Embedding lookups).
+- Casting both T5Attention AND T5FeedForward to fp32: 0.072 → 0.066.
+  Marginal. Confirms the noise is pervasive across all bf16 ops, not
+  just attention.
+
+**What we shipped:** Match Python's bf16 semantics exactly (per the
+isomorphic-structure rule), with a parity test threshold of `0.15`
+(catches structural port bugs that would compound to `>> 0.5`, allows
+the documented ~0.12 kernel drift). The Python port's downstream
+DiT/Avatar parity tests use thresholds in the 1e-2 range — text
+embeddings are not the most sensitive input, and a 7%-relative
+divergence on umT5 output is well within what diffusion conditioning
+tolerates without producing visibly different output.
+
+**Skill update target:** `common-pitfalls.md` — add a "Swift port
+runtime divergence" entry. Recommendation: when porting a deep bf16
+attention model from Python-MLX to Swift-MLX, expect 5-10% relative
+divergence on the final output and budget parity thresholds
+accordingly. The structural correctness check is "is it within 10× of
+the kernel drift baseline?" not "is it within fp32 rounding?"
+
+**Open question for next port:** would mlx-swift's `MLXFast.scaledDotProductAttention`
+(if applicable to T5's no-scaling no-mask convention) bypass the
+divergent kernel path? Worth checking on the next port that touches
+multi-head attention.
