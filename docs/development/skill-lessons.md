@@ -505,3 +505,72 @@ isomorphism the rule was protecting.
 **Skill update target:** `SKILL.md` — clarify the "no refactoring" rule
 with: "preserve isomorphism *with the checkpoint's canonical reference*
 — refactor away from MLX precedents that target a different reference."
+
+## L19. HF CLI 1.x dropped `hf upload --create-repo` — use `hf repo create --exist-ok` `[toolkit candidate]`
+
+**What we hit:** Our publish script used `hf upload <repo> <file> --create-repo`
+which worked at the time of the initial bf16 publish. By the time we
+went to publish the q4/q8 quant variants the local CLI had bumped to
+1.16.4 and that flag is gone:
+
+```
+Error: No such option '--create-repo'.
+Did you mean: --create-pr, --no-create-pr?
+```
+
+The new flow is `hf repo create <repo> --type model --exist-ok` (idempotent)
+followed by a plain `hf upload`. `--exist-ok` makes the create call safe
+to re-run after first publish without erroring on "already exists".
+
+Bonus failure mode: when running `bash publish.sh quant 2>&1 | tee log`,
+the script's internal `set -euo pipefail` masks `hf upload`'s exit code
+through the outer pipe — the *driving* shell sees `tee`'s exit status
+(0), so the task reports success despite the inner failure. Always
+check the log content, not just the exit code.
+
+**Skill update target:** `common-pitfalls.md` — add a "HF CLI quirks"
+section: the `--create-repo` deprecation + the bash-pipe exit-code
+masking gotcha. Recommend the split `hf repo create --exist-ok` + `hf
+upload` pattern for all future publish scripts.
+
+## L20. `hf upload` of large multi-GB repos stalls in `CLOSE_WAIT` without retry `[toolkit candidate]`
+
+**What we hit:** Running `hf upload mlx-community/<repo> <local-dir> .` for
+~31 GB of sharded safetensors (the q8-merged DiT). After ~10 minutes the
+process was still alive (RSS 4.7 GB, ~37s CPU time) but had completely
+stopped making progress:
+
+```bash
+lsof -p <PID> | grep TCP
+# Python ... TCP 10.46.15.54:... -> cloudfront ...:https (CLOSE_WAIT)
+
+netstat -ib | awk '/en0/ {print $7}'
+# Outbound bytes: ~1.4 KB/s
+```
+
+`CLOSE_WAIT` means the remote (CloudFront / xet CDN) tore the connection
+down but our `hf upload` never `close()`'d it on our side and never
+retried. The CLI logs nothing — looks alive from the outside, including
+to a parent `bash` watcher.
+
+Made worse by: when run via `bash publish.sh quant 2>&1 | tee log.txt`,
+`set -euo pipefail` does not propagate up through the outer pipeline
+either, so any harness that watches "exit code 0 = success" gets fooled.
+
+**Diagnostic recipe:**
+1. `ps -o pid,rss,time,etime -p <PID>` — alive but CPU time << elapsed → IO-bound
+2. `lsof -p <PID> | grep TCP` — any `CLOSE_WAIT` is the smoking gun
+3. `netstat -ib` 5-sec delta on the relevant interface — <10 KB/s = stalled
+
+**Workaround:** `kill <PID>` and re-run the same command from an
+interactive terminal. `hf upload` is content-addressed (xet), so files
+that *did* upload are skipped on retry — net cost is just the time to
+re-hash and re-stream what was in flight. Running interactively also
+gives Ctrl-C if a second stall happens.
+
+**Skill update target:** `common-pitfalls.md` — extend the "HF CLI quirks"
+section started in L19 with: (a) `hf upload` lacks a watchdog timeout for
+CLOSE_WAIT sockets on multi-GB repos; (b) for any upload >10 GB, drive
+it from an interactive terminal where the user can Ctrl-C; (c) tee with
+`set -euo pipefail` does NOT propagate through outer pipelines — use
+`> log.txt 2>&1` for background uploads instead.

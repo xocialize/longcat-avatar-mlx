@@ -7,14 +7,20 @@ Silicon (M-series).
 End-to-end inference produces visually coherent, audio-synced video on a
 single 128 GB M5 Max:
 
-| Variant | Sampler | First frame @ 256×432×29 |
-|---|---|---|
-| `bf16` | 50-step Flow Matching | ~6 min |
-| `bf16-dmd-merged` | 8-step DMD distilled | **~105 s** |
+| Variant | Sampler | Disk | 29-frame wall clock @ 256×432 |
+|---|---|---|---|
+| `bf16` | 50-step Flow Matching | 46 GB | ~6 min |
+| `bf16-dmd-merged` | 8-step DMD distilled | 43 GB | **~105 s** |
+| `q4-dmd-merged` | 8-step DMD distilled | 24 GB | ~102 s |
+| `q8-dmd-merged` | 8-step DMD distilled | 31 GB | ~151 s |
 
-Published weights (mlx-community):
-- [mlx-community/LongCat-Video-Avatar-1.5-bf16](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16) — base bf16 + separate DMD LoRA
-- [mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged) — DMD pre-merged into DiT (recommended)
+Published on HuggingFace as a collection:
+[🤗 mlx-community/longcat-video-avatar-15-mlx](https://huggingface.co/collections/mlx-community/longcat-video-avatar-15-mlx-6a185d1af4a43074d882e375)
+
+- 🤗 [`bf16-dmd-merged`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged) — DMD pre-merged into DiT, **recommended for 64 GB+ Macs** (43 GB)
+- 🤗 [`bf16`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16) — base bf16 + separate DMD LoRA, for runtime-merge / multi-strength experiments (46 GB)
+- 🤗 [`q4-dmd-merged`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-q4-dmd-merged) — 4-bit DiT, **recommended for 32–48 GB Macs** (24 GB, comparable speed to bf16)
+- 🤗 [`q8-dmd-merged`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-q8-dmd-merged) — 8-bit DiT, middle-ground RAM/quality (31 GB)
 
 ## Quick start
 

@@ -290,13 +290,80 @@ def convert_whisper(out_dir: pathlib.Path, dtype=mx.bfloat16) -> None:
     )
 
 
-def convert_dit(out_dir: pathlib.Path, dtype=mx.bfloat16, lora_to_merge: Optional[dict] = None) -> None:
+# ---------------------------------------------------------------------------
+# Quantization
+# ---------------------------------------------------------------------------
+
+# Skip patterns for DiT quantization. Mirrors Meituan's shipped INT8 skip
+# rule (`final_layer.linear`) plus our own additions for high-sensitivity
+# embedders and AdaLN modulation linears (kept at fp32 per CLAUDE.md L11).
+DIT_QUANT_SKIP_PATTERNS: list[str] = [
+    "final_layer.linear",   # Meituan's documented skip pattern
+    "t_embedder.",          # TimestepEmbedder MLP — small + sensitive
+    "y_embedder.",          # CaptionEmbedder MLP — small + sensitive
+    "adaLN_modulation.",    # per-block AdaLN-Zero modulation (must stay fp32)
+    "audio_adaLN_modulation.",  # avatar audio adaLN
+]
+
+
+def _should_quantize_dit_linear(path: str, module) -> bool:
+    """class_predicate for `mlx.nn.quantize` on the DiT.
+
+    Quantizes `nn.Linear` only; skips per `DIT_QUANT_SKIP_PATTERNS`.
+    """
+    import mlx.nn as nn
+
+    if not isinstance(module, nn.Linear):
+        return False
+    for pat in DIT_QUANT_SKIP_PATTERNS:
+        if pat in path:
+            return False
+    return True
+
+
+def _write_dit_config_with_quant(out_dir: pathlib.Path, bits: int, group_size: int) -> None:
+    """Copy Meituan's base_model/config.json then inject a `quantization`
+    block so the runtime loader can apply `nn.quantize` before loading
+    weights into the model.
+    """
+    from huggingface_hub import hf_hub_download
+
+    src = hf_hub_download(
+        repo_id="meituan-longcat/LongCat-Video-Avatar-1.5",
+        filename="base_model/config.json",
+    )
+    cfg = json.loads(pathlib.Path(src).read_text())
+    cfg["quantization"] = {
+        "method": "mlx.nn.quantize",
+        "bits": bits,
+        "group_size": group_size,
+        "skip_patterns": DIT_QUANT_SKIP_PATTERNS,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+
+def convert_dit(
+    out_dir: pathlib.Path,
+    dtype=mx.bfloat16,
+    lora_to_merge: Optional[dict] = None,
+    quantize_bits: Optional[int] = None,
+    quantize_group_size: int = 64,
+) -> None:
     """meituan-longcat/LongCat-Video-Avatar-1.5/base_model → out_dir/dit/
 
-    If `lora_to_merge` is provided, the LoRA is pre-merged before saving
-    (DMD-merged variant). Otherwise the base bf16 DiT is saved as-is.
+    Args:
+        dtype: target dtype for non-quantized layers. Default bf16.
+        lora_to_merge: pre-loaded DMD LoRA `state_dict` (dict[str, mx.array]).
+            When provided, the LoRA is merged into the DiT before saving.
+        quantize_bits: if set (4 or 8), the DiT Linears are quantized via
+            `mlx.nn.quantize` with `group_size=quantize_group_size`. Skip
+            patterns documented in DIT_QUANT_SKIP_PATTERNS.
+        quantize_group_size: group size for quantization. Default 64
+            (matches mlx-lm convention).
     """
-    print(f"  Converting Avatar DiT → {out_dir}/dit/")
+    qstr = f" [q{quantize_bits}]" if quantize_bits else ""
+    print(f"  Converting Avatar DiT{qstr} → {out_dir}/dit/")
     src = _load_pt_safetensors_sharded(
         "meituan-longcat/LongCat-Video-Avatar-1.5",
         "base_model/diffusion_pytorch_model.safetensors.index.json",
@@ -310,7 +377,6 @@ def convert_dit(out_dir: pathlib.Path, dtype=mx.bfloat16, lora_to_merge: Optiona
         print("    Merging DMD LoRA into base DiT weights...")
         from longcat_video_avatar.lora import compute_merged_delta, group_lora_tensors
 
-        # lora_to_merge is already a dict[str, mx.array] from `_load_pt_safetensors`
         grouped = group_lora_tensors(lora_to_merge)
         merged_count = 0
         for module_path, group in grouped.items():
@@ -324,12 +390,58 @@ def convert_dit(out_dir: pathlib.Path, dtype=mx.bfloat16, lora_to_merge: Optiona
             merged_count += 1
         print(f"    Merged {merged_count} LoRA target modules")
 
-    _save_sharded_safetensors(mlx_sd, out_dir / "dit", base_name="diffusion_pytorch_model")
-    _copy_meituan_config(
-        "meituan-longcat/LongCat-Video-Avatar-1.5",
-        "base_model/config.json",
-        out_dir / "dit" / "config.json",
-    )
+    # Quantization path: instantiate the DiT model, load the bf16 (+LoRA)
+    # weights, apply nn.quantize, then snapshot the now-quantized parameters.
+    if quantize_bits is not None:
+        assert quantize_bits in (4, 8), f"quantize_bits must be 4 or 8, got {quantize_bits}"
+        print(f"    Quantizing DiT Linears to {quantize_bits}-bit (group_size={quantize_group_size})...")
+
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten, tree_unflatten
+
+        from longcat_video_avatar.models.avatar.longcat_video_dit_avatar import (
+            LongCatVideoAvatarTransformer3DModel,
+        )
+
+        # Build the model with the Meituan base_model config (ignoring our
+        # quantization block since this is the BF16 model we'll quantize from).
+        from huggingface_hub import hf_hub_download
+
+        src_cfg_path = hf_hub_download(
+            repo_id="meituan-longcat/LongCat-Video-Avatar-1.5",
+            filename="base_model/config.json",
+        )
+        base_cfg = json.loads(pathlib.Path(src_cfg_path).read_text())
+        model = LongCatVideoAvatarTransformer3DModel.from_config(base_cfg)
+
+        # Load bf16 weights into the model
+        model.update(tree_unflatten(list(mlx_sd.items())))
+        mx.eval(model.parameters())
+        del mlx_sd  # free bf16 dict before quantization
+
+        # Quantize Linears in place
+        nn.quantize(
+            model,
+            group_size=quantize_group_size,
+            bits=quantize_bits,
+            class_predicate=_should_quantize_dit_linear,
+        )
+
+        # Snapshot the now-quantized parameter tree
+        quantized_sd = dict(tree_flatten(model.parameters()))
+        del model
+
+        _save_sharded_safetensors(quantized_sd, out_dir / "dit", base_name="diffusion_pytorch_model")
+        _write_dit_config_with_quant(
+            out_dir / "dit", bits=quantize_bits, group_size=quantize_group_size
+        )
+    else:
+        _save_sharded_safetensors(mlx_sd, out_dir / "dit", base_name="diffusion_pytorch_model")
+        _copy_meituan_config(
+            "meituan-longcat/LongCat-Video-Avatar-1.5",
+            "base_model/config.json",
+            out_dir / "dit" / "config.json",
+        )
 
 
 def convert_lora(out_dir: pathlib.Path) -> None:
@@ -456,6 +568,141 @@ def build_base_variant(out_dir: pathlib.Path, *, skip_done: bool = True) -> None
     print(f"DONE: {out_dir}")
 
 
+def build_quantized_merged_variant(
+    out_dir: pathlib.Path, *, bits: int, group_size: int = 64, skip_done: bool = True
+) -> None:
+    """Build the `LongCat-Video-Avatar-1.5-q{bits}-dmd-merged` variant.
+
+    DMD LoRA is merged into base bf16 DiT, then the DiT is quantized to
+    `bits`-bit (4 or 8) via `mlx.nn.quantize`. umT5 / Whisper / VAE remain
+    at bf16 — they're small contributors to total disk and quantizing them
+    would degrade output quality more than save space.
+    """
+    print(f"Building q{bits}-dmd-merged variant → {out_dir}")
+    if skip_done and _component_done(out_dir, "vae", "diffusion_pytorch_model.safetensors"):
+        print("  VAE already converted — skipping")
+    else:
+        convert_vae(out_dir)
+    if skip_done and _component_done(out_dir, "text_encoder", "model.safetensors.index.json"):
+        print("  umT5 already converted — skipping")
+    else:
+        convert_umt5(out_dir)
+    if skip_done and _component_done(out_dir, "audio_encoder", "model.safetensors"):
+        print("  Whisper encoder already converted — skipping")
+    else:
+        convert_whisper(out_dir)
+    if skip_done and _component_done(
+        out_dir, "dit", "diffusion_pytorch_model.safetensors.index.json"
+    ):
+        print(f"  DiT (q{bits}-dmd-merged) already converted — skipping")
+    else:
+        print("  Pre-loading DMD LoRA for in-place merge...")
+        lora_sd = _load_pt_safetensors(
+            "meituan-longcat/LongCat-Video-Avatar-1.5", "lora/dmd_lora.safetensors"
+        )
+        convert_dit(
+            out_dir,
+            lora_to_merge=lora_sd,
+            quantize_bits=bits,
+            quantize_group_size=group_size,
+        )
+    copy_scheduler_and_tokenizer(out_dir)
+    write_pipeline_config(out_dir, merged=True)
+    # Tweak the README for the quant variant — the merged-variant README is
+    # generic enough but mentions disk numbers that will be wrong for q-variants.
+    _write_quant_readme(out_dir, bits=bits)
+    print(f"DONE: {out_dir}")
+
+
+def _write_quant_readme(out_dir: pathlib.Path, *, bits: int) -> None:
+    """Generate a minimal README pointing at the canonical model card.
+    The full markdown is generated by docs/model-cards/quant.md.j2 style
+    template upstream; here we just stamp out a short pointer + the
+    quantization-specific facts.
+    """
+    readme = f"""---
+license: mit
+library_name: mlx
+pipeline_tag: text-to-video
+tags:
+  - mlx
+  - apple-silicon
+  - video-generation
+  - audio-driven-video
+  - longcat
+  - distilled
+  - quantized
+  - {bits}-bit
+base_model:
+  - mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged
+language:
+  - en
+  - zh
+---
+
+Part of the [LongCat-Video-Avatar 1.5 — MLX](https://huggingface.co/collections/mlx-community/longcat-video-avatar-15-mlx-6a185d1af4a43074d882e375) collection.
+
+# LongCat-Video-Avatar-1.5-q{bits}-dmd-merged (MLX)
+
+{bits}-bit quantized variant of [mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged).
+Same model, same DMD pre-merge, same 8-step inference path — just with the
+DiT Linears quantized to {bits}-bit via `mlx.nn.quantize` for smaller-RAM Macs.
+
+| | |
+|---|---|
+| **DiT** | {bits}-bit quantized (`group_size=64`, skip `final_layer.linear` + embedders + AdaLN) |
+| **DiT shards** | ~{"11" if bits == 4 else "18"} GB ({"3" if bits == 4 else "4"} shards) |
+| **umT5 / Whisper / VAE** | bf16 (unchanged from the bf16-dmd-merged variant) |
+| **Total disk** | ~{"24" if bits == 4 else "31"} GB |
+| **Min unified memory** | ~{"24" if bits == 4 else "32"} GB |
+| **Inference** | 8-step DMD distilled (unchanged) |
+| **License** | MIT |
+
+## Performance
+
+Measured on Apple M5 Max (128 GB unified memory), 256 × 432 × 29 frames,
+8-step DMD sampling:
+
+| Variant | Wall clock | ms/frame |
+|---|---|---|
+| bf16-dmd-merged | ~105 s | ~3.6 s |
+| **q4-dmd-merged** | ~102 s | ~3.5 s |
+| **q8-dmd-merged** | ~151 s | ~5.2 s |
+
+q4 is bandwidth-bound (matches bf16 throughput); q8 currently runs slower
+on M5's quantized matmul kernels but uses ~half the DiT disk vs bf16. Pick
+the variant by RAM budget, not speed.
+
+## Loading
+
+The runtime pipeline (`longcat_video_avatar.pipeline_mlx.LongCatAvatarPipeline`)
+auto-detects the `quantization` block in `dit/config.json` and applies
+`mlx.nn.quantize` before loading the quantized weights. No user-facing API
+change vs. the bf16 variant.
+
+```bash
+hf download mlx-community/LongCat-Video-Avatar-1.5-q{bits}-dmd-merged \\
+    --local-dir ./weights
+.venv/bin/python scripts/run_inference.py \\
+    --weights ./weights/.. \\
+    --variant q{bits}-merged \\
+    --num-frames 93 \\
+    --out output.mp4
+```
+
+## Source
+
+Quantized from the bf16-dmd-merged variant via
+[`recipes/convert_longcat_avatar.py`](https://github.com/xocialize/longcat-avatar-mlx/blob/main/recipes/convert_longcat_avatar.py).
+Run with `--variant q{bits}-merged --out <dir>` to reproduce from Meituan's
+PT sources.
+
+See the [bf16-dmd-merged card](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged)
+for full architecture details, citation, and the non-quantized variant.
+"""
+    (out_dir / "README.md").write_text(readme)
+
+
 def build_merged_variant(out_dir: pathlib.Path, *, skip_done: bool = True) -> None:
     """Build the `LongCat-Video-Avatar-1.5-bf16-dmd-merged` variant
     (DMD LoRA pre-merged into DiT)."""
@@ -492,9 +739,14 @@ def main():
     parser = argparse.ArgumentParser(description="Convert LongCat-Video-Avatar-1.5 to MLX format")
     parser.add_argument(
         "--variant",
-        choices=("base", "merged", "both"),
+        choices=("base", "merged", "both", "q4-merged", "q8-merged"),
         default="both",
-        help="Which variant(s) to produce.",
+        help=(
+            "Which variant(s) to produce. "
+            "`base`/`merged`/`both`: bf16 variants (with separate LoRA / pre-merged / both). "
+            "`q4-merged`/`q8-merged`: quantized DiT (Linears only, skipping final_layer / "
+            "embedders / AdaLN) on top of the pre-merged DMD weights."
+        ),
     )
     parser.add_argument(
         "--out",
@@ -508,6 +760,14 @@ def main():
         build_base_variant(args.out / "LongCat-Video-Avatar-1.5-bf16")
     if args.variant in ("merged", "both"):
         build_merged_variant(args.out / "LongCat-Video-Avatar-1.5-bf16-dmd-merged")
+    if args.variant == "q4-merged":
+        build_quantized_merged_variant(
+            args.out / "LongCat-Video-Avatar-1.5-q4-dmd-merged", bits=4
+        )
+    if args.variant == "q8-merged":
+        build_quantized_merged_variant(
+            args.out / "LongCat-Video-Avatar-1.5-q8-dmd-merged", bits=8
+        )
 
 
 if __name__ == "__main__":
