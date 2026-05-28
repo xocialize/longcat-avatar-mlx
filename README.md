@@ -12,9 +12,9 @@ single 128 GB M5 Max:
 | `bf16` | 50-step Flow Matching | ~6 min |
 | `bf16-dmd-merged` | 8-step DMD distilled | **~105 s** |
 
-Published weights (mlx-community):
-- [mlx-community/LongCat-Video-Avatar-1.5-bf16](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16) — base bf16 + separate DMD LoRA
-- [mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged) — DMD pre-merged into DiT (recommended)
+Published weights (mlx-community, live ✅):
+- 🤗 [mlx-community/LongCat-Video-Avatar-1.5-bf16](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16) — base bf16 + separate DMD LoRA (49 GB, 26 files)
+- 🤗 [mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged) — DMD pre-merged into DiT, **recommended** (46 GB, 25 files)
 
 ## Quick start
 

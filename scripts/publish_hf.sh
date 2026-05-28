@@ -26,13 +26,13 @@ case "${1:-help}" in
     echo "=== Stage 1: model cards + configs (validates auth, creates repos) ==="
     echo "[1/2] $BASE_REPO"
     hf upload "$BASE_REPO" "$BASE_DIR/README.md" "README.md" \
-        --repo-type model --create-pr=False --create-repo
+        --repo-type model --create-repo
     hf upload "$BASE_REPO" "$BASE_DIR/pipeline_config.json" "pipeline_config.json" \
         --repo-type model
     echo ""
     echo "[2/2] $MERGED_REPO"
     hf upload "$MERGED_REPO" "$MERGED_DIR/README.md" "README.md" \
-        --repo-type model --create-pr=False --create-repo
+        --repo-type model --create-repo
     hf upload "$MERGED_REPO" "$MERGED_DIR/pipeline_config.json" "pipeline_config.json" \
         --repo-type model
     echo ""
@@ -63,14 +63,14 @@ case "${1:-help}" in
     # Upload only the merged variant (typical workflow: ship recommended first)
     echo "=== Upload merged variant only ==="
     hf upload "$MERGED_REPO" "$MERGED_DIR/README.md" "README.md" \
-        --repo-type model --create-pr=False --create-repo
+        --repo-type model --create-repo
     hf upload "$MERGED_REPO" "$MERGED_DIR" "." --repo-type model
     ;;
 
   base)
     echo "=== Upload base variant only ==="
     hf upload "$BASE_REPO" "$BASE_DIR/README.md" "README.md" \
-        --repo-type model --create-pr=False --create-repo
+        --repo-type model --create-repo
     hf upload "$BASE_REPO" "$BASE_DIR" "." --repo-type model
     ;;
 
