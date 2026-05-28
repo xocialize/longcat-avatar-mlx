@@ -77,9 +77,62 @@ def tokenize_prompt(prompt: str, weights_dir: pathlib.Path) -> tuple[mx.array, m
     return ids, mask
 
 
-def build_pipeline(weights_dir: pathlib.Path, merged_variant: bool = True):
+VARIANT_DIRNAMES: dict[str, str] = {
+    "merged": "LongCat-Video-Avatar-1.5-bf16-dmd-merged",
+    "base": "LongCat-Video-Avatar-1.5-bf16",
+    "q4-merged": "LongCat-Video-Avatar-1.5-q4-dmd-merged",
+    "q8-merged": "LongCat-Video-Avatar-1.5-q8-dmd-merged",
+}
+
+
+def _quantize_dit_for_load(dit, quant_cfg: dict) -> None:
+    """Apply `mlx.nn.quantize` to a freshly-constructed DiT *before* loading
+    quantized weights — required so `QuantizedLinear` modules are installed
+    in the right places before the bit-packed `weight`/`scales`/`biases`
+    tensors land via `load_weights`.
+
+    The skip rule must match what the conversion recipe used (see
+    `recipes.convert_longcat_avatar.DIT_QUANT_SKIP_PATTERNS`); we duplicate
+    it inline rather than import to keep the runtime free of conversion-time
+    dependencies (huggingface_hub, etc.).
+    """
+    import mlx.nn as nn
+
+    skip_patterns: list[str] = quant_cfg.get(
+        "skip_patterns",
+        [
+            "final_layer.linear",
+            "t_embedder.",
+            "y_embedder.",
+            "adaLN_modulation.",
+            "audio_adaLN_modulation.",
+        ],
+    )
+
+    def predicate(path: str, module) -> bool:
+        if not isinstance(module, nn.Linear):
+            return False
+        for pat in skip_patterns:
+            if pat in path:
+                return False
+        return True
+
+    nn.quantize(
+        dit,
+        group_size=int(quant_cfg.get("group_size", 64)),
+        bits=int(quant_cfg["bits"]),
+        class_predicate=predicate,
+    )
+
+
+def build_pipeline(weights_dir: pathlib.Path, variant: str = "merged"):
     """Construct LongCatAvatarPipeline by loading each component from the
     converted MLX weights.
+
+    Supports `variant` in {"merged", "base", "q4-merged", "q8-merged"}.
+    Quantized variants are detected via the `quantization` block in
+    `dit/config.json` and matched with `mlx.nn.quantize` *before* loading
+    weights.
     """
     from longcat_video_avatar.models.autoencoder_kl_wan import AutoencoderKLWan
     from longcat_video_avatar.models.avatar.longcat_video_dit_avatar import (
@@ -89,11 +142,11 @@ def build_pipeline(weights_dir: pathlib.Path, merged_variant: bool = True):
     from longcat_video_avatar.models.whisper import WhisperEncoder
     from longcat_video_avatar.pipeline_mlx import LongCatAvatarPipeline, PipelineConfig
 
-    variant_dir = (
-        weights_dir / "LongCat-Video-Avatar-1.5-bf16-dmd-merged"
-        if merged_variant
-        else weights_dir / "LongCat-Video-Avatar-1.5-bf16"
-    )
+    if variant not in VARIANT_DIRNAMES:
+        raise ValueError(
+            f"Unknown variant {variant!r}. Choose from {list(VARIANT_DIRNAMES)}"
+        )
+    variant_dir = weights_dir / VARIANT_DIRNAMES[variant]
 
     print(f"Loading from {variant_dir}")
 
@@ -115,9 +168,18 @@ def build_pipeline(weights_dir: pathlib.Path, merged_variant: bool = True):
     whisper = WhisperEncoder.from_config(whisper_cfg)
     whisper.load_weights(str(variant_dir / "audio_encoder" / "model.safetensors"), strict=False)
 
-    # DiT
+    # DiT (possibly quantized)
     dit_cfg = json.loads((variant_dir / "dit" / "config.json").read_text())
+    quant_cfg = dit_cfg.get("quantization")
     dit = LongCatVideoAvatarTransformer3DModel.from_config(dit_cfg)
+    if quant_cfg is not None:
+        print(
+            f"  DiT quantization detected: {quant_cfg['bits']}-bit, "
+            f"group_size={quant_cfg.get('group_size', 64)}, "
+            f"skipping {len(quant_cfg.get('skip_patterns', []))} pattern(s) "
+            f"— applying nn.quantize before load_weights"
+        )
+        _quantize_dit_for_load(dit, quant_cfg)
     dit_idx = json.loads((variant_dir / "dit" / "diffusion_pytorch_model.safetensors.index.json").read_text())
     for shard_name in sorted(set(dit_idx["weight_map"].values())):
         dit.load_weights(str(variant_dir / "dit" / shard_name), strict=False)
@@ -128,7 +190,7 @@ def build_pipeline(weights_dir: pathlib.Path, merged_variant: bool = True):
     pipeline = LongCatAvatarPipeline(vae=vae, text_encoder=umt5, audio_encoder=whisper, dit=dit, config=cfg)
 
     # For the base variant, merge the LoRA on the fly
-    if not merged_variant:
+    if variant == "base":
         from safetensors.torch import load_file as torch_load_file
 
         # We saved with mx.save_safetensors; reload as mx
@@ -147,7 +209,11 @@ def build_pipeline(weights_dir: pathlib.Path, merged_variant: bool = True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=pathlib.Path, required=True)
-    parser.add_argument("--variant", choices=("base", "merged"), default="merged")
+    parser.add_argument(
+        "--variant",
+        choices=("base", "merged", "q4-merged", "q8-merged"),
+        default="merged",
+    )
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--num-frames", type=int, default=93)
@@ -163,7 +229,7 @@ def main():
 
     print("\n[1/5] Building pipeline (loading converted weights)...")
     t0 = time.time()
-    pipeline = build_pipeline(args.weights, merged_variant=(args.variant == "merged"))
+    pipeline = build_pipeline(args.weights, variant=args.variant)
     print(f"  pipeline loaded in {time.time() - t0:.1f}s")
 
     print("[2/5] Preprocessing image...")
@@ -173,7 +239,8 @@ def main():
     audio_mel = preprocess_audio_mel(audio_path)
 
     print("[4/5] Encoding prompt...")
-    ids, mask = tokenize_prompt(prompt, args.weights / f"LongCat-Video-Avatar-1.5-bf16{'-dmd-merged' if args.variant == 'merged' else ''}")
+    # All variants ship an identical tokenizer (verbatim umT5 copy)
+    ids, mask = tokenize_prompt(prompt, args.weights / VARIANT_DIRNAMES[args.variant])
     text_hidden = pipeline.text_encoder(ids, mask=mask)
     text_embeds = text_hidden[:, None, :, :]  # [B, 1, N_text, C]
     text_mask = mask[:, None, None, :]

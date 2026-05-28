@@ -95,10 +95,12 @@ video = pipeline(image=ref_image_chw, audio_mel=mel_features,
 
 ## Variants
 
-| Variant | DMD LoRA | Sampling | Runtime cost |
-|---|---|---|---|
-| **bf16-dmd-merged** *(this card)* | merged into DiT weights | 8-step (default) | smallest disk + simplest load |
-| [bf16](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16) | separate file | 8-step (after merge) or 50-step (without merge) | 2.5 GB more on disk; pipeline calls `merge_dmd_lora()` at load |
+| Variant | DiT dtype | Disk | Sampling | Best for |
+|---|---|---|---|---|
+| **bf16-dmd-merged** *(this card)* | bf16 | 43 GB | 8-step | 64 GB+ Macs, recommended baseline |
+| [bf16](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16) | bf16 (+ separate LoRA) | 46 GB | 8-step or 50-step | runtime-merge / multi-strength experiments |
+| [q4-dmd-merged](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-q4-dmd-merged) | 4-bit quantized | 24 GB | 8-step | 32–48 GB Macs, comparable speed to bf16 |
+| [q8-dmd-merged](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-q8-dmd-merged) | 8-bit quantized | 31 GB | 8-step | middle ground RAM / quality |
 
 ## Performance
 
