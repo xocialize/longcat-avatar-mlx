@@ -109,16 +109,45 @@ per-step cost (2 DiT forwards dominate) with one compile boundary.
 
 ### Expected wins (modest, NOT slam-dunk)
 
-| Variant | Step count | Per-step time | Compile benefit expected |
-|---|---|---|---|
-| `bf16-dmd-merged` 8-step | 8 | ~13 s/step | 5-15% wall-clock (small dispatch fraction at 13s/step; warm-up costs 1-2 steps' worth on first call) |
-| `bf16` 50-step | 50 | similar | 10-20% wall-clock (more steps to amortize warm-up; may approach memory-bound) |
-| `q4-dmd-merged` 8-step | 8 | similar | Likely similar to bf16-dmd (Linear ops dominate; mx.fast.quantized_matmul already fused) |
+**Update 2026-06-05 — empirically refuted on Lance, almost certainly
+won't help here either.** lance-mlx ran an isolated A/B
+(`scripts/diagnostics/d_todo2_compile_ab_v2.py`) on its 6.2B MoT
+backbone forward and measured:
 
-These are **5-20% wins, not 2-3×.** The LongCat DiT is 13.6B params;
-per-step is largely compute-bound on the matmul side. `mx.compile`
-helps most when dispatch / temp-allocation overhead is the bottleneck,
-which is true for small models or many small ops, less true here.
+  - Output equivalence: bit-identical (max|Δ| = 0.00e+00)
+  - Baseline mean: 808 ms/forward
+  - Compiled steady-state: **831 ms/forward (−2.8% REGRESSION)**
+  - JIT trace overhead: +853 ms one-time
+
+`mx.compile` was bit-identical (preserves correctness) but actively
+slower at steady state. Per-step compute at this scale is dominated
+by `mx.fast.scaled_dot_product_attention` and matmul kernels that are
+already heavily fused; `mx.compile`'s graph fusion can't meaningfully
+reduce dispatch overhead when the existing path is already kernel-
+bound, but it does pay tracing overhead.
+
+**Inference for LongCat:** the DiT here is 13.6B (2.2× larger than
+Lance), so the per-step compute is proportionally *more* kernel-bound,
+not less. The dispatch-overhead fraction shrinks with model size, and
+mx.compile's win is bounded by that fraction. Almost certainly < 0%
+on a real A/B at this scale. The original 5-20% range below was
+speculative and is **superseded by the Lance empirical result**.
+
+Below table is left for context but treat the column as "predicted
+before empirical evidence" — actual numbers would need an isolated
+LongCat-specific re-run if anyone wants to verify:
+
+| Variant | Step count | Per-step time | Original speculative estimate |
+|---|---|---|---|
+| `bf16-dmd-merged` 8-step | 8 | ~13 s/step | (was) 5-15% — likely 0% or negative |
+| `bf16` 50-step | 50 | similar | (was) 10-20% — likely 0% or negative |
+| `q4-dmd-merged` 8-step | 8 | similar | Same as bf16-dmd |
+
+**Recommended action:** skip `mx.compile` for LongCat unless a future
+MLX upstream lands new compile optimizations at this model scale. If
+that happens, port the lance-mlx v2 benchmark
+(`d_todo2_compile_ab_v2.py`) and re-measure on the LongCat DiT
+forward. If the delta flips positive, revisit then.
 
 ### Risks specific to LongCat
 
