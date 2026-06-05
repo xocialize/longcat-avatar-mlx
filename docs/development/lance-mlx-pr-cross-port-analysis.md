@@ -1,10 +1,28 @@
 # Cross-port analysis: lance-mlx PRs → LongCat
 
 **Date:** 2026-06-05
+**Updated:** 2026-06-05 (same day) with revised findings after a
+second-pass code read across all four Wan-family VAE modules.
 **Triggered by:** Three substantive optimization PRs landed on
 `xocialize/lance-mlx` recently. This doc enumerates what would
 transfer to LongCat, what the effort actually looks like, and which
 items rank highest if we invest the hours.
+
+> **⚠️ Read first:** the streaming-decode portion of this analysis
+> has been superseded by
+> [phantom-wan-mlx/docs/development/streaming-vae-decode-port-handoff.md](../../../phantom-wan-mlx/docs/development/streaming-vae-decode-port-handoff.md).
+> The second-pass code read uncovered two surprises that change the
+> recommended sequencing: (1) mlx-video stock `wan_2/vae.py` (used by
+> phantom-wan and bernini-r) is incomplete for streaming — its
+> `Resample.upsample3d` doesn't honor `feat_cache`; (2) LongCat's
+> `autoencoder_kl_wan.py` is MORE complete than mlx-video stock —
+> its `Resample.upsample3d` already has the diffusers `"Rep"` sentinel.
+> Net effect: the highest-leverage port target is mlx-video stock
+> (benefits phantom-wan + bernini-r + upstreamable), not LongCat's
+> private fork. LongCat streaming port effort drops from 4-8 hr to
+> 2-4 hr because the orchestrator is the only missing piece.
+> The LongCat-specific sections below are still accurate for the
+> LongCat port itself; only the sequencing recommendation has changed.
 
 ## Source PRs
 
@@ -64,22 +82,46 @@ unchanged.
 | | • `_unpatchify` → may not exist or may be inlined |
 | | • Tensor layout: Lance NHWC `(B, T, H, W, C)` → ours NCHWD `(B, C, T, H, W)` — every axis index in the streaming code needs translation |
 | Bit-identity test pattern | Lance's `tests/test_decode_stream.py` (280 LOC, 50 cases, weights-free, max\|Δ\|=0) is the gold-standard test pattern. Direct mirror should work — build a tiny random-init `AutoencoderKLWan` and assert `decode_streaming(dec, z) == dec(z)` bit-exact. |
-| Effort | **Moderate.** 400-500 LOC stream module + 250 LOC test, careful axis-index translation. Maybe 4-8 hours including parity validation. |
+| Effort (**revised 2026-06-05**) | **Cheaper than original estimate.** Our `Resample.upsample3d` already has the diffusers `"Rep"` sentinel cache pattern (autoencoder_kl_wan.py:270-310), so the per-stage cross-chunk plumbing exists. Only the top-level orchestrator (`AutoencoderKLWan.decode_streaming(z, chunk_lat=1)` that allocates `feat_cache = [None] * num_slots` and walks z by temporal chunks) is missing. Maybe ~150-200 LOC + 250 LOC test = **2-4 hours**. |
 | Win on LongCat | Decode peak flat in frame count + halo-tile spatial = the long-video paths benefit most. Concretely the same Lance numbers (256² × 121f: 15.4 GB whole → 8.0 GB streaming) should hold on our VAE modulo channel count (16 vs 48 ratio modifies peaks proportionally) |
-| **Verdict** | **Best single-PR win for the effort.** Recommended next port if you allocate optimization time. |
+| **Verdict** | **Defer to end** (per user direction). When picked up, cheaper than originally estimated. |
 
-## Recommended sequence (refined)
+## Recommended sequence (revised 2026-06-05)
+
+The second-pass code read reshuffled the priority. The headline change:
+**mlx-video stock `wan_2/vae.py` is the highest-leverage port target**
+because it benefits phantom-wan + bernini-r simultaneously (both ride
+the same upstream) and is upstreamable to `Blaizzy/mlx-video`. LongCat's
+private fork is the *cheapest* port (because the `"Rep"` sentinel is
+already wired) but lowest leverage (single port). User direction:
+**defer LongCat regardless**.
 
 1. **Update the `mx.compile` recommendation in
    `scheduler-and-compile-evaluation.md`** — done 2026-06-05; Lance
    empirical refutation makes the speculative LongCat estimate stale.
-2. **PR #7 → LongCat lossless streaming decode** — moderate effort,
-   biggest single-PR win, well-bounded scope, has a gold-standard test
-   pattern to mirror.
-3. **PR #6 → LongCat memory_mode** — high leverage but a 1-2 day
+2. **PR #7 → mlx-video stock `wan_2/vae.py`** — moderate effort
+   (~4-6 hr), two beneficiaries (phantom-wan + bernini-r), upstreamable.
+   See [phantom-wan-mlx handoff](../../../phantom-wan-mlx/docs/development/streaming-vae-decode-port-handoff.md)
+   for full work-breakdown.
+3. **PR #7 → LongCat `AutoencoderKLWan`** — 2-4 hr (revised down from
+   4-8 hr after Surprise 2). **Defer to end per user direction.** The
+   stage-A work on mlx-video stock surfaces the orchestrator pattern
+   and de-risks the LongCat port. After that, the LongCat-specific port
+   is mostly mechanical: add `decode_streaming(z, chunk_lat=1)` to
+   `AutoencoderKLWan`, mirror the bit-identity test, ship.
+4. **PR #6 → LongCat memory_mode** — high leverage but a 1-2 day
    focused session. Worth doing once the Swift port S4.x work
    stabilizes so we don't ship two changing things at once.
-4. **PR #4 DPM scheduler** — low priority; only helps bf16 50-step
+5. **Un-fork LongCat onto mlx-video stock?** — investigated; **not
+   directly possible**. The channel arithmetic at `dim_mult=[1,2,4,4]`
+   differs structurally between mlx-video's halve-on-input pattern and
+   diffusers/Meituan's keep-and-project pattern (see
+   `notes/vae-schema-mismatch.md`). The *opposite* direction works:
+   upstream our `AutoencoderKLWan` to mlx-video as a sibling class or
+   `schema="diffusers"` flag on `WanVAE`. Effort ~4-6 hr, benefit
+   ceiling = single port (us) + any future ports needing the diffusers
+   schema. **Defer indefinitely** unless a second consumer surfaces.
+6. **PR #4 DPM scheduler** — low priority; only helps bf16 50-step
    minority variant. Defer indefinitely unless a user case appears
    that needs faster bf16 base path generation.
 
@@ -114,9 +156,15 @@ Lance reference files (for the algorithm + tests):
 
 ## Cross-reference
 
-A parallel analysis for `bernini-r-mlx` (Wan2.2-A14B renderer) is
-likely worth writing if anyone touches that port — Bernini-R uses
-`AutoencoderKLWan` too but with a different channel count, and uses
-`FlowUniPCScheduler` (already a sophisticated multistep solver) so PR
-#4 doesn't transfer. PR #7 and PR #6 transfer similarly with
-similar effort to LongCat.
+Bernini-R uses **mlx-video stock** `wan_2.vae.WanVAE` (verified
+2026-06-05 via grep on `bernini_r_mlx/sampling.py`), **NOT** a private
+fork. So a streaming-decode port at the mlx-video upstream level
+benefits bernini-r and phantom-wan with one effort. PR #6 memory_mode
+still requires a per-port port (bernini-r has 3 phases: umT5 → DiT →
+VAE) but is cheaper than LongCat's 4-phase variant.
+
+For the full corrected sequencing and the streaming-decode
+work-breakdown, see
+[phantom-wan-mlx/docs/development/streaming-vae-decode-port-handoff.md](../../../phantom-wan-mlx/docs/development/streaming-vae-decode-port-handoff.md)
+— that doc supersedes the original sequencing recommendation in this
+file.
