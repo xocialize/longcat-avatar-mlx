@@ -82,7 +82,7 @@ unchanged.
 | | • `_unpatchify` → may not exist or may be inlined |
 | | • Tensor layout: Lance NHWC `(B, T, H, W, C)` → ours NCHWD `(B, C, T, H, W)` — every axis index in the streaming code needs translation |
 | Bit-identity test pattern | Lance's `tests/test_decode_stream.py` (280 LOC, 50 cases, weights-free, max\|Δ\|=0) is the gold-standard test pattern. Direct mirror should work — build a tiny random-init `AutoencoderKLWan` and assert `decode_streaming(dec, z) == dec(z)` bit-exact. |
-| Effort (**revised 2026-06-05**) | **Cheaper than original estimate.** Our `Resample.upsample3d` already has the diffusers `"Rep"` sentinel cache pattern (autoencoder_kl_wan.py:270-310), so the per-stage cross-chunk plumbing exists. Only the top-level orchestrator (`AutoencoderKLWan.decode_streaming(z, chunk_lat=1)` that allocates `feat_cache = [None] * num_slots` and walks z by temporal chunks) is missing. Maybe ~150-200 LOC + 250 LOC test = **2-4 hours**. |
+| Effort (**revised 2026-06-05 — second correction same day**) | **Near-zero. The work is already done.** Both `Resample.upsample3d` (with `"Rep"` sentinel) AND the top-level orchestrator in `AutoencoderKLWan.decode()` (per-frame loop, `feat_cache` threading, output concatenation along temporal axis) are already in place in `autoencoder_kl_wan.py:716-735`. The streaming pattern is the **default** decode path, not an opt-in. `encode()` (line 681) is also already streaming. The earlier "missing orchestrator" claim was wrong — I read the inner blocks (Resample) but didn't audit the top-level entry point until writing the longcat-video-mlx deferred-port handoff. **Residual scope:** one optional self-consistency bit-identity test (~30 min, weights-free, mirror of `lance-mlx/tests/test_decode_stream.py`). See [`longcat-video-mlx/docs/development/streaming-vae-decode-deferred-port-handoff.md`](../../../longcat-video-mlx/docs/development/streaming-vae-decode-deferred-port-handoff.md) for the full audit. |
 | Win on LongCat | Decode peak flat in frame count + halo-tile spatial = the long-video paths benefit most. Concretely the same Lance numbers (256² × 121f: 15.4 GB whole → 8.0 GB streaming) should hold on our VAE modulo channel count (16 vs 48 ratio modifies peaks proportionally) |
 | **Verdict** | **Defer to end** (per user direction). When picked up, cheaper than originally estimated. |
 
@@ -103,12 +103,15 @@ already wired) but lowest leverage (single port). User direction:
    (~4-6 hr), two beneficiaries (phantom-wan + bernini-r), upstreamable.
    See [phantom-wan-mlx handoff](../../../phantom-wan-mlx/docs/development/streaming-vae-decode-port-handoff.md)
    for full work-breakdown.
-3. **PR #7 → LongCat `AutoencoderKLWan`** — 2-4 hr (revised down from
-   4-8 hr after Surprise 2). **Defer to end per user direction.** The
-   stage-A work on mlx-video stock surfaces the orchestrator pattern
-   and de-risks the LongCat port. After that, the LongCat-specific port
-   is mostly mechanical: add `decode_streaming(z, chunk_lat=1)` to
-   `AutoencoderKLWan`, mirror the bit-identity test, ship.
+3. **PR #7 → LongCat `AutoencoderKLWan`** — **AUDIT COMPLETE 2026-06-05:
+   no port needed.** Both the `"Rep"` sentinel (in `Resample.upsample3d`)
+   and the streaming orchestrator (in `AutoencoderKLWan.decode()` /
+   `.encode()`) are already in place as the default code path — the
+   original LongCat VAE port author implemented streaming-by-default
+   when matching the diffusers reference. Residual work: one optional
+   self-consistency bit-identity test (~30 min). Full audit + pickup
+   plan in
+   [`longcat-video-mlx/docs/development/streaming-vae-decode-deferred-port-handoff.md`](../../../longcat-video-mlx/docs/development/streaming-vae-decode-deferred-port-handoff.md).
 4. **PR #6 → LongCat memory_mode** — high leverage but a 1-2 day
    focused session. Worth doing once the Swift port S4.x work
    stabilizes so we don't ship two changing things at once.
