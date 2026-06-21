@@ -40,7 +40,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mvs-collective/longcat-avatar-mlx"
+Homepage = "https://github.com/xocialize/longcat-avatar-mlx"
 Reference = "https://github.com/meituan-longcat/LongCat-Video"
 
 [tool.setuptools]
