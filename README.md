@@ -101,6 +101,48 @@ prompt     ──▶ umT5 encode ──┐    │
                              Wan VAE decode ──▶ video
 ```
 
+## Avatar 1.6, long videos and LoRA training
+
+`longcat_video_avatar/generation.py` follows Meituan's reference pipeline end to end and adds what the
+v1 pipeline left out: 1.6, video continuation (any length), starting from real footage, and memory
+fixes that let 720p-class sizes run on a 64 GB Mac.
+
+```bash
+# 1.6 weights (base DiT converted to MLX + DMD/OPSD LoRAs + the shared 1.5 components)
+hf download fedeinfe/LongCat-Video-Avatar-1.6-MLX-bf16 --local-dir weights/LongCat-Video-Avatar-1.6-bf16
+
+.venv/bin/python scripts/generate.py --weights weights/LongCat-Video-Avatar-1.6-bf16 \
+    --image portrait.png --audio voice.wav --prompt prompt.txt --out talking.mp4
+# 720p-class: --size 1120x832 --vae-tile 64      continue real footage: --start-video clip.mov --start-at 3.0
+```
+
+| | v1 `pipeline_mlx.py` | `generation.py` |
+|---|---|---|
+| guidance with the distilled model | 3-pass CFG, text 4 / audio 4 | 1.0, one pass per step (Meituan forces it with `--use_distill`) |
+| reference image | extra latent in front, dropped | first latent, timestep 0, never updated (`generate_ai2v`) |
+| length | one 93-frame clip | any: continuation from the last 13 frames + reference (`generate_avc`) |
+| 1.6 | — | runtime DMD → OPSD LoRA switch at `mix_steps` (`runtime_lora.py`) |
+| continuation cost | — | conditioning keys/values cached, exact (`kv_cache.py`), ~20% faster |
+| VAE decode peak (480p) | +26 GB (whole graph built before eval) | streamed per latent; optional fp32 tiles |
+| audio | 1.5 loudness norm always | per version (on for 1.5, off for 1.6), overridable |
+
+`recipes/convert_dit.py` converts any Meituan `base_model/` shard by shard (that's how the 1.6 DiT was made).
+
+LoRA training (e.g. to adapt mouth and motion style to one speaker from ~40 two-second clips with their audio):
+
+```bash
+python -m training.prepare_data --weights weights/LongCat-Video-Avatar-1.6-bf16 --clips my_clips/ --out data/person
+python -m training.train_lora --dit weights/LongCat-Video-Avatar-1.6-bf16/dit --data data/person --out loras/person
+python scripts/generate.py ... --lora loras/person/lora-0125.safetensors
+```
+
+Full size (49 frames, 640x512) peaks at ~49.6 GB and runs ~65 s/step on an M5 Max; `--chunk N` saves and exits
+every N steps and resumes bit-exactly, to share the GPU with other jobs.
+
+Bug fix in `models/avatar/attention.py`: in continuation with `mask_frame_range == 0` (Meituan's default)
+the reference-frame and conditioning tokens fell into the "standard" branch and attended to each other;
+Meituan keeps them separate (`attention.py:149`). Covered by `tests/smoke/test_continuation_smoke.py`.
+
 ## Hardware requirements
 
 - **Apple Silicon M-series** (tested on M5 Max 128 GB unified memory).
