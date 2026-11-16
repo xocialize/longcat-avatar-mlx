@@ -80,9 +80,10 @@ class Attention(_BaseAttention):
             and num_cond_latents > 1
             and num_ref_latents is not None
             and ref_img_index is not None
-            and mask_frame_range is not None
-            and mask_frame_range > 0
         ):
+            # Video continuation (Meituan attention.py:149): the reference frame and the conditioning
+            # frames attend separately, also when mask_frame_range == 0. Previously this branch only
+            # ran for mask_frame_range > 0 and the "standard" branch below merged ref + cond tokens.
             num_ref_thw = tokens_per_frame  # one ref frame's worth of tokens
             ncl_thw = num_cond_latents * tokens_per_frame
 
@@ -103,8 +104,10 @@ class Attention(_BaseAttention):
             else:
                 q_noise = q[:, :, ncl_thw:]
 
-                start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
-                end_noise = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
+                start_noise, end_noise = 0, 0
+                if mask_frame_range is not None and mask_frame_range > 0:
+                    start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
+                    end_noise = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
 
                 if start_noise >= 0 and end_noise > start_noise and end_noise <= num_noisy_frames:
                     start_pos = start_noise * tokens_per_frame
