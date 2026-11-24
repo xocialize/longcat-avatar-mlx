@@ -49,15 +49,15 @@ Converted weights, per-component layout (`dit/`, `lora/`, `text_encoder/`, `toke
 
 | Variant | DiT | LoRAs | CLI `--variant` |
 |---|---|---|---|
-| `LongCat-Video-Avatar-1.6-bf16` | bf16 | DMD + OPSD, runtime | `v1.6-bf16` |
-| `LongCat-Video-Avatar-1.6-q8` | 8-bit | DMD + OPSD, runtime | `v1.6-q8` |
-| `LongCat-Video-Avatar-1.6-q4` | 4-bit | DMD + OPSD, runtime | `v1.6-q4` |
+| [`LongCat-Video-Avatar-1.6-bf16`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.6-bf16) | bf16 | DMD + OPSD, runtime | `v1.6-bf16` |
+| [`LongCat-Video-Avatar-1.6-q8`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.6-q8) | 8-bit | DMD + OPSD, runtime | `v1.6-q8` |
+| [`LongCat-Video-Avatar-1.6-q4`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.6-q4) | 4-bit | DMD + OPSD, runtime | `v1.6-q4` |
 | [`LongCat-Video-Avatar-1.5-bf16-dmd-merged`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged) | bf16, DMD merged | — | `merged` |
 | [`LongCat-Video-Avatar-1.5-bf16`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-bf16) | bf16 | DMD, merged at load | `base` |
 | [`LongCat-Video-Avatar-1.5-q4-dmd-merged`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-q4-dmd-merged) | 4-bit, DMD merged | — | `q4-merged` |
 | [`LongCat-Video-Avatar-1.5-q8-dmd-merged`](https://huggingface.co/mlx-community/LongCat-Video-Avatar-1.5-q8-dmd-merged) | 8-bit, DMD merged | — | `q8-merged` |
 
-The 1.6 variants are built with the recipe below; they are not on the Hub yet.
+All seven are on the Hub under `mlx-community`. The recipe below rebuilds the 1.6 ones from Meituan's sources.
 
 ## Speed and memory (1.6 bf16, M5 Max 128 GB)
 
@@ -79,8 +79,11 @@ python3.12 -m venv .venv
 .venv/bin/pip install -e ".[parity]"      # parity extras pull torch/diffusers/transformers
 .venv/bin/pip install librosa Pillow mlx-arsenal
 
-# 2. Convert the 1.6 weights (downloads Meituan's sources, about 50 GB; writes about 47 GB)
-.venv/bin/python -m recipes.convert_longcat_avatar --variant v1.6-bf16 --out ./weights
+# 2. Pull the converted weights (46 GB; `-q8` is 33 GB, `-q4` 26 GB)
+hf download mlx-community/LongCat-Video-Avatar-1.6-bf16 \
+    --local-dir ./weights/LongCat-Video-Avatar-1.6-bf16
+#    or convert them yourself from Meituan's sources:
+#    .venv/bin/python -m recipes.convert_longcat_avatar --variant v1.6-bf16 --out ./weights
 
 # 3. Run against Meituan's demo inputs, or your own (ffmpeg muxes the speech into the MP4)
 .venv/bin/python scripts/run_inference.py \
