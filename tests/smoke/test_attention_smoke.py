@@ -82,3 +82,24 @@ if __name__ == "__main__":
     test_cross_attention_b2_blockdiag_mask()
     test_cross_attention_with_num_cond_latents()
     print("all attention smoke tests passed")
+
+
+def test_query_sliced_attention_matches_dense():
+    """Over the score budget, `_process_attn` slices the queries; rows of an
+    attention matrix are independent, so the result equals the dense call."""
+    import mlx.core as mx
+
+    from longcat_video_avatar.models.attention import Attention
+
+    attn = Attention(dim=64, num_heads=4)
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((1, 4, 50, 16)) for _ in range(3))
+    dense = attn._process_attn(q, k, v)
+    attn.ATTN_SCORE_BUDGET_BYTES = 4 * 50 * 4 * 7  # 7 query rows per slice (fp32), an uneven last slice
+    sliced = attn._process_attn(q, k, v)
+    assert sliced.shape == dense.shape
+    # Metal's fp32 matmul rounds differently per shape (skill-lessons L10): compare at 1e-2, not at epsilon.
+    assert float(mx.abs(sliced - dense).max()) < 1e-2
+    # Cross-shaped attention (fewer queries than keys), as the noise-query branch uses.
+    q2 = q[:, :, :20]
+    assert float(mx.abs(attn._process_attn(q2, k, v) - mx.fast.scaled_dot_product_attention(q2, k, v, scale=attn.scale)).max()) < 1e-2

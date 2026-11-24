@@ -12,7 +12,16 @@ isn't compatible across language bindings.
 
 Usage:
     .venv/bin/python scripts/dump_pipeline_swift_fixtures.py \\
-        --out /Users/dustinnielson/DEV_INT/longcat-avatar-mlx-swift/Tests/LongCatVideoAvatarTests/Resources/pipeline-parity/
+        --out <swift repo>/Tests/LongCatVideoAvatarTests/Resources/pipeline-parity/
+
+Avatar 1.6 (a local variant directory written by the recipe, with the DMD and
+OPSD LoRAs switched per step):
+    .venv/bin/python scripts/dump_pipeline_swift_fixtures.py \\
+        --variant-dir <weights>/LongCat-Video-Avatar-1.6-bf16 \\
+        --out <swift repo>/Tests/LongCatVideoAvatarTests/Resources/pipeline-parity-v16/
+That run also writes `output_dmd_only.npy` (the same inputs with the DMD LoRA
+on all 8 steps): the distance between the two outputs is what the LoRA switch
+contributes, so a Swift port that never switched would land on the wrong one.
 """
 
 from __future__ import annotations
@@ -94,20 +103,42 @@ def main() -> None:
         "--weights",
         default="mlx-community/LongCat-Video-Avatar-1.5-bf16-dmd-merged",
     )
+    parser.add_argument(
+        "--variant-dir",
+        type=pathlib.Path,
+        default=None,
+        help="Local variant directory (recipe layout); used instead of --weights. "
+        "A 1.6 variant gets its runtime LoRA schedule.",
+    )
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading pipeline from {args.weights}...")
-    vae, umt5, whisper, dit = _load_pipeline_components(args.weights)
-
     from longcat_video_avatar.pipeline_mlx import LongCatAvatarPipeline, PipelineConfig
-    cfg = PipelineConfig(num_frames=NUM_FRAMES)
-    pipeline = LongCatAvatarPipeline(
-        vae=vae, text_encoder=umt5, audio_encoder=whisper, dit=dit, config=cfg
-    )
+
+    if args.variant_dir is not None:
+        import sys
+
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import run_inference
+
+        print(f"Loading pipeline from {args.variant_dir}...")
+        name_to_variant = {v: k for k, v in run_inference.VARIANT_DIRNAMES.items()}
+        pipeline = run_inference.build_pipeline(
+            args.variant_dir.parent, variant=name_to_variant[args.variant_dir.name]
+        )
+        pipeline.config.num_frames = NUM_FRAMES
+        cfg = pipeline.config
+        args.weights = args.variant_dir.name
+    else:
+        print(f"Loading pipeline from {args.weights}...")
+        vae, umt5, whisper, dit = _load_pipeline_components(args.weights)
+        cfg = PipelineConfig(num_frames=NUM_FRAMES)
+        pipeline = LongCatAvatarPipeline(
+            vae=vae, text_encoder=umt5, audio_encoder=whisper, dit=dit, config=cfg
+        )
 
     # ---- Generate inputs ----
     print(f"Building inputs (H=W={HEIGHT}, T={NUM_FRAMES}, T_mel={T_MEL})")
@@ -133,21 +164,36 @@ def main() -> None:
     print("Running Python-MLX pipeline (this will take ~30-60s)...")
     pipeline._make_initial_noise = lambda *_args, **_kwargs: mx.array(noise_np)
 
-    output = pipeline(
-        image=mx.array(image_np),
-        audio_mel=mx.array(mel_np),
-        text_embeds=mx.array(text_np),
-        text_mask=mx.array(text_mask_np),
-        uncond_embeds=mx.array(uncond_np),
-        uncond_mask=mx.array(uncond_mask_np),
-        num_frames=NUM_FRAMES,
-        height=HEIGHT,
-        width=WIDTH,
-        seed=args.seed,
-    )
-    output = output.astype(mx.float32)
-    mx.eval(output)
-    out_np = np.asarray(output)
+    def run() -> np.ndarray:
+        output = pipeline(
+            image=mx.array(image_np),
+            audio_mel=mx.array(mel_np),
+            text_embeds=mx.array(text_np),
+            text_mask=mx.array(text_mask_np),
+            uncond_embeds=mx.array(uncond_np),
+            uncond_mask=mx.array(uncond_mask_np),
+            num_frames=NUM_FRAMES,
+            height=HEIGHT,
+            width=WIDTH,
+            seed=args.seed,
+        )
+        output = output.astype(mx.float32)
+        mx.eval(output)
+        return np.asarray(output)
+
+    out_np = run()
+    lora_mix = pipeline.lora_mix
+    dmd_only_np = None
+    if lora_mix is not None:
+        # Control: DMD on all 8 steps. What the per-step switch changes.
+        shipped_steps = lora_mix.mix_steps
+        lora_mix.mix_steps = cfg.num_sampling_steps
+        lora_mix._active = None
+        dmd_only_np = run()
+        lora_mix.mix_steps = shipped_steps
+        lora_mix._active = None
+        switch_delta = float(np.abs(out_np - dmd_only_np).max())
+        print(f"  LoRA switch contributes max_abs {switch_delta:.4g} (default schedule vs DMD on all steps)")
     print(f"  output: shape={out_np.shape}, dtype={out_np.dtype}, abs.max={np.abs(out_np).max():.4g}")
 
     # ---- Save fixtures ----
@@ -161,6 +207,8 @@ def main() -> None:
         "initial_noise.npy": noise_np,
         "output.npy": out_np,
     }
+    if dmd_only_np is not None:
+        paths["output_dmd_only.npy"] = dmd_only_np
     for name, arr in paths.items():
         p = args.out / name
         np.save(p, arr)
@@ -173,6 +221,15 @@ def main() -> None:
         "generator": "longcat-avatar-mlx/scripts/dump_pipeline_swift_fixtures.py",
         "source_weights": args.weights,
         "seed": args.seed,
+        "lora_mix": None
+        if lora_mix is None
+        else {
+            "mix_steps": lora_mix.mix_steps,
+            "mix_alpha": lora_mix.mix_alpha,
+            "target_modules": len(lora_mix.modules),
+            "switch_max_abs": float(np.abs(out_np - dmd_only_np).max()),
+            "switch_mean_abs": float(np.abs(out_np - dmd_only_np).mean()),
+        },
         "config": {
             "height": HEIGHT,
             "width": WIDTH,
