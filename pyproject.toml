@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "longcat-video-avatar-mlx"
-version = "0.1.0.dev0"
-description = "Apple MLX port of LongCat-Video-Avatar-1.5 (audio-driven video diffusion)"
+version = "0.2.0"
+description = "Apple MLX port of LongCat-Video-Avatar 1.6 / 1.5 (audio-driven video diffusion)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -64,9 +64,10 @@ def get_dmd_distilled_sigmas(
         sigmas = flip(linspace(0, 1, num_train_timesteps))[idx]
         sigmas = flip(sigmas)
     """
-    if model_type != "avatar-v1.5":
+    # Avatar 1.6 reuses the 1.5 schedule (upstream maps avatar-v1.6 to avatar-v1.5).
+    if model_type not in ("avatar-v1.5", "avatar-v1.6"):
         raise NotImplementedError(
-            f"Only model_type='avatar-v1.5' is implemented; got {model_type!r}. "
+            f"Only model_type='avatar-v1.5' / 'avatar-v1.6' is implemented; got {model_type!r}. "
             "Other LongCat variants use a different distillation schedule."
         )
 

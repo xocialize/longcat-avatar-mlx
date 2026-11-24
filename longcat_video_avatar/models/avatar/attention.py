@@ -73,16 +73,15 @@ class Attention(_BaseAttention):
         # specific temporal position)
         q, k = self.rope_3d(q, k, shape, frame_index=ref_img_index, num_ref_latents=num_ref_latents)
 
-        # Reference Skip Q-slicing path (video continuation with masked range).
-        # Activates only when num_cond_latents > 1 AND mask_frame_range > 0.
-        if (
-            num_cond_latents is not None
-            and num_cond_latents > 1
-            and num_ref_latents is not None
-            and ref_img_index is not None
-            and mask_frame_range is not None
-            and mask_frame_range > 0
-        ):
+        # Video continuation (PT `num_cond_latents > 1`): the reference frame and
+        # the conditioning frames each attend only within themselves, whatever
+        # `mask_frame_range` is. `mask_frame_range > 0` additionally hides the
+        # reference from the noise frames around `ref_img_index` (Reference
+        # Skip); with 0, the Avatar 1.6 default, every noise query sees all keys.
+        if num_cond_latents is not None and num_cond_latents > 1:
+            assert num_ref_latents is not None and ref_img_index is not None, (
+                "No specified insertion position for reference frame"
+            )
             num_ref_thw = tokens_per_frame  # one ref frame's worth of tokens
             ncl_thw = num_cond_latents * tokens_per_frame
 
@@ -103,8 +102,10 @@ class Attention(_BaseAttention):
             else:
                 q_noise = q[:, :, ncl_thw:]
 
-                start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
-                end_noise = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
+                start_noise, end_noise = 0, 0
+                if mask_frame_range is not None and mask_frame_range > 0:
+                    start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
+                    end_noise = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
 
                 if start_noise >= 0 and end_noise > start_noise and end_noise <= num_noisy_frames:
                     start_pos = start_noise * tokens_per_frame
@@ -126,8 +127,8 @@ class Attention(_BaseAttention):
                 else:
                     x_noise = self._process_attn(q_noise, k, v)
                 out = mx.concatenate([x_ref, x_cond, x_noise], axis=2)
-        elif num_cond_latents is not None and num_cond_latents > 0:
-            # Standard cond branching (matches base)
+        elif num_cond_latents is not None and num_cond_latents == 1:
+            # Image to video: the one conditioning frame attends within itself
             ncl_thw = num_cond_latents * tokens_per_frame
             q_cond = q[:, :, :ncl_thw]
             k_cond = k[:, :, :ncl_thw]

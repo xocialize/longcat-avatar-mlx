@@ -37,30 +37,73 @@ def load_demo_inputs():
     return image_path, audio_path, prompt
 
 
-def preprocess_image(image_path: pathlib.Path, height: int = 480, width: int = 832) -> mx.array:
-    """Load + resize + normalize image to [B=1, 3, T=1, H, W] in [-1, 1]."""
+# PT `ASPECT_RATIO_627` (longcat_video/utils/bukcet_config.py): the 480p buckets,
+# `height / width ratio -> (height, width)`. PT picks the bucket closest to the
+# reference image's ratio (`get_condition_shape`).
+BUCKETS_480P = {
+    0.26: (320, 1216), 0.31: (352, 1120), 0.38: (384, 1024), 0.43: (416, 960), 0.52: (448, 864),
+    0.58: (480, 832), 0.67: (512, 768), 0.74: (544, 736), 0.86: (576, 672), 0.95: (608, 640),
+    1.05: (640, 608), 1.17: (672, 576), 1.29: (704, 544), 1.35: (736, 544), 1.50: (768, 512),
+    1.67: (800, 480), 1.73: (832, 480), 2.00: (896, 448), 2.31: (960, 416), 2.58: (992, 384),
+    2.75: (1056, 384), 3.09: (1088, 352), 3.70: (1184, 320), 3.80: (1216, 320), 3.90: (1248, 320),
+    4.00: (1280, 320),
+}
+
+
+def bucket_size(image_path: pathlib.Path) -> tuple[int, int]:
+    """(height, width) of the 480p bucket closest to the image's aspect ratio."""
     from PIL import Image
 
-    img = Image.open(image_path).convert("RGB").resize((width, height), Image.BICUBIC)
+    with Image.open(image_path) as img:
+        ratio = img.height / img.width
+    return BUCKETS_480P[min(BUCKETS_480P, key=lambda r: abs(r - ratio))]
+
+
+def preprocess_image(image_path: pathlib.Path, height: int = 480, width: int = 832) -> mx.array:
+    """Load, resize to cover `width x height`, centre-crop (PT resize_mode
+    "crop"), normalize to [B=1, 3, T=1, H, W] in [-1, 1]."""
+    from PIL import Image
+
+    img = Image.open(image_path).convert("RGB")
+    scale = max(width / img.width, height / img.height)
+    resized = img.resize((max(width, round(img.width * scale)), max(height, round(img.height * scale))), Image.BICUBIC)
+    left, top = (resized.width - width) // 2, (resized.height - height) // 2
+    img = resized.crop((left, top, left + width, top + height))
     arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0  # [H, W, 3] in [-1, 1]
     arr = arr.transpose(2, 0, 1)  # [3, H, W]
     return mx.array(arr[None, :, None, :, :])  # [1, 3, 1, H, W]
 
 
-def preprocess_audio_mel(audio_path: pathlib.Path, sample_rate: int = 16000) -> mx.array:
-    """Load audio + compute Whisper mel spectrogram via transformers FE.
-    Returns [1, 128, T_mel]."""
+MEL_CHUNK_SAMPLES = 750 * 640  # PT `MEL_CHUNK`: 30 s at 16 kHz per feature-extractor call
+
+
+def preprocess_audio_mel(
+    audio_path: pathlib.Path, seconds: Optional[float] = None, sample_rate: int = 16000
+) -> tuple[mx.array, int]:
+    """Load audio, cut or zero-pad it to `seconds`, and compute the Whisper mel
+    in 30 s chunks (each padded and normalized on its own, as PT does).
+
+    Returns `(mel [1, 128, 3000 * chunks], num_samples)`. No loudness
+    normalization (PT skips it for Avatar 1.6) and no vocal separation: give
+    the model clean speech.
+    """
     try:
         import librosa
     except ImportError as e:
         raise ImportError("librosa is required to load audio. `pip install librosa`") from e
     from transformers import WhisperFeatureExtractor
 
-    audio, sr = librosa.load(str(audio_path), sr=sample_rate)
+    audio, _ = librosa.load(str(audio_path), sr=sample_rate)
+    if seconds is not None:
+        count = int(np.ceil(seconds * sample_rate))
+        audio = audio[:count] if len(audio) >= count else np.concatenate([audio, np.zeros(count - len(audio), np.float32)])
     fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
-    inputs = fe(audio, sampling_rate=sample_rate, return_tensors="np")
-    mel = inputs.input_features  # [1, 128, T_mel] numpy
-    return mx.array(mel.astype(np.float32))
+    chunks = [
+        fe(audio[i : i + MEL_CHUNK_SAMPLES], sampling_rate=sample_rate, return_tensors="np").input_features
+        for i in range(0, len(audio), MEL_CHUNK_SAMPLES)
+    ]
+    mel = np.concatenate(chunks, axis=-1)  # [1, 128, T_mel]
+    return mx.array(mel.astype(np.float32)), len(audio)
 
 
 def tokenize_prompt(prompt: str, weights_dir: pathlib.Path) -> tuple[mx.array, mx.array]:
@@ -82,6 +125,10 @@ VARIANT_DIRNAMES: dict[str, str] = {
     "base": "LongCat-Video-Avatar-1.5-bf16",
     "q4-merged": "LongCat-Video-Avatar-1.5-q4-dmd-merged",
     "q8-merged": "LongCat-Video-Avatar-1.5-q8-dmd-merged",
+    # Avatar 1.6: base DiT + DMD and OPSD LoRAs switched per denoising step.
+    "v1.6-bf16": "LongCat-Video-Avatar-1.6-bf16",
+    "v1.6-q8": "LongCat-Video-Avatar-1.6-q8",
+    "v1.6-q4": "LongCat-Video-Avatar-1.6-q4",
 }
 
 
@@ -125,11 +172,24 @@ def _quantize_dit_for_load(dit, quant_cfg: dict) -> None:
     )
 
 
-def build_pipeline(weights_dir: pathlib.Path, variant: str = "merged"):
+def _load_mlx_safetensors(path: pathlib.Path) -> dict:
+    """`mx.load` keeps bf16 (numpy-backed safetensors readers do not)."""
+    return mx.load(str(path))
+
+
+def build_pipeline(
+    weights_dir: pathlib.Path,
+    variant: str = "merged",
+    mix_steps: Optional[int] = None,
+    mix_alpha: Optional[float] = None,
+):
     """Construct LongCatAvatarPipeline by loading each component from the
     converted MLX weights.
 
-    Supports `variant` in {"merged", "base", "q4-merged", "q8-merged"}.
+    Supports the 1.5 variants {"merged", "base", "q4-merged", "q8-merged"} and
+    the 1.6 variants {"v1.6-bf16", "v1.6-q8", "v1.6-q4"}. A 1.6 variant attaches
+    its DMD and OPSD LoRAs as runtime side-paths; `mix_steps` / `mix_alpha`
+    override the schedule in its `pipeline_config.json` (default 4 / 1.0).
     Quantized variants are detected via the `quantization` block in
     `dit/config.json` and matched with `mlx.nn.quantize` *before* loading
     weights.
@@ -203,6 +263,21 @@ def build_pipeline(weights_dir: pathlib.Path, variant: str = "merged"):
         result = pipeline.merge_dmd_lora(lora_sd, multiplier=1.0)
         print(f"  LoRA merge: applied {len(result['applied'])}, unmapped {len(result['unmapped'])}")
 
+    # Avatar 1.6: both LoRAs stay unmerged and are switched per denoising step.
+    pipe_cfg_path = variant_dir / "pipeline_config.json"
+    lora_cfg = (json.loads(pipe_cfg_path.read_text()) if pipe_cfg_path.exists() else {}).get("lora")
+    if lora_cfg and lora_cfg.get("mode") == "runtime_mix":
+        mix = pipeline.attach_lora_mix(
+            _load_mlx_safetensors(variant_dir / lora_cfg["dmd"]),
+            _load_mlx_safetensors(variant_dir / lora_cfg["opsd"]),
+            mix_alpha=lora_cfg.get("mix_alpha", 1.0) if mix_alpha is None else mix_alpha,
+            mix_steps=lora_cfg.get("mix_steps", 4) if mix_steps is None else mix_steps,
+        )
+        print(
+            f"  LoRA mix: {len(mix.modules)} target modules, "
+            f"mix_steps={mix.mix_steps}, mix_alpha={mix.mix_alpha}"
+        )
+
     return pipeline
 
 
@@ -211,32 +286,58 @@ def main():
     parser.add_argument("--weights", type=pathlib.Path, required=True)
     parser.add_argument(
         "--variant",
-        choices=("base", "merged", "q4-merged", "q8-merged"),
+        choices=tuple(VARIANT_DIRNAMES),
         default="merged",
     )
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--num-frames", type=int, default=93)
+    parser.add_argument("--height", type=int, default=None, help="default: the 480p bucket closest to the image's aspect ratio")
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--num-frames", type=int, default=93, help="frames per segment (4k + 1)")
+    parser.add_argument("--num-segments", type=int, default=1, help="1 image-to-video segment + N-1 continuations (80 new frames each)")
+    parser.add_argument("--text-guidance-scale", type=float, default=None, help="default 1.0 (distilled: no CFG)")
+    parser.add_argument("--audio-guidance-scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=pathlib.Path, default=REPO_ROOT / "scripts" / "output.mp4")
+    parser.add_argument("--mix-steps", type=int, default=None, help="1.6 only: leading steps using mix_alpha*DMD + (1-mix_alpha)*OPSD (default 4)")
+    parser.add_argument("--mix-alpha", type=float, default=None, help="1.6 only: DMD weight during the mixed steps (default 1.0)")
+    parser.add_argument("--image", type=pathlib.Path, default=None, help="reference image (default: Meituan's demo)")
+    parser.add_argument("--audio", type=pathlib.Path, default=None, help="speech audio (default: Meituan's demo)")
+    parser.add_argument("--prompt", type=str, default=None, help="scene prompt (default: Meituan's demo)")
     args = parser.parse_args()
 
     print("=== LongCat-Avatar MLX e2e inference ===")
     image_path, audio_path, prompt = load_demo_inputs()
+    image_path = args.image or image_path
+    audio_path = args.audio or audio_path
+    prompt = args.prompt or prompt
     print(f"Image:  {image_path}")
     print(f"Audio:  {audio_path}")
     print(f"Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
 
     print("\n[1/5] Building pipeline (loading converted weights)...")
     t0 = time.time()
-    pipeline = build_pipeline(args.weights, variant=args.variant)
+    pipeline = build_pipeline(
+        args.weights, variant=args.variant, mix_steps=args.mix_steps, mix_alpha=args.mix_alpha
+    )
     print(f"  pipeline loaded in {time.time() - t0:.1f}s")
+
+    if args.text_guidance_scale is not None:
+        pipeline.config.text_guidance_scale = args.text_guidance_scale
+    if args.audio_guidance_scale is not None:
+        pipeline.config.audio_guidance_scale = args.audio_guidance_scale
+    if args.height is None or args.width is None:
+        args.height, args.width = bucket_size(image_path)
+    total_frames = pipeline.frames_for_segments(args.num_segments, args.num_frames)
+    print(f"  {args.width}x{args.height}, {args.num_segments} segment(s), {total_frames} frames "
+          f"({total_frames / pipeline.config.target_fps:.2f} s)")
 
     print("[2/5] Preprocessing image...")
     image = preprocess_image(image_path, height=args.height, width=args.width)
 
     print("[3/5] Preprocessing audio...")
-    audio_mel = preprocess_audio_mel(audio_path)
+    # PT: the audio covers the generated duration plus one second.
+    audio_mel, audio_num_samples = preprocess_audio_mel(
+        audio_path, seconds=total_frames / pipeline.config.target_fps + 1.0
+    )
 
     print("[4/5] Encoding prompt...")
     # All variants ship an identical tokenizer (verbatim umT5 copy)
@@ -251,7 +352,15 @@ def main():
     uncond_embeds = uncond_hidden[:, None, :, :]
     uncond_mask = empty_mask[:, None, None, :]
 
-    print("[5/5] Running denoising loop (8 DMD steps)...")
+    print("[5/5] Running denoising loop (8 distilled steps per segment)...")
+    step_t = [time.time()]
+
+    def on_step(segment, step, total):
+        now = time.time()
+        if step > 0:
+            print(f"    segment {segment + 1} step {step}/{total}: {now - step_t[0]:.1f}s", flush=True)
+        step_t[0] = now
+
     t1 = time.time()
     video = pipeline(
         image=image,
@@ -264,10 +373,14 @@ def main():
         width=args.width,
         num_frames=args.num_frames,
         seed=args.seed,
+        num_segments=args.num_segments,
+        audio_num_samples=audio_num_samples,
+        on_step=on_step,
     )
     mx.eval(video)
     elapsed = time.time() - t1
-    print(f"  inference complete in {elapsed:.1f}s ({elapsed / args.num_frames * 1000:.0f} ms/frame)")
+    print(f"  inference complete in {elapsed:.1f}s ({elapsed / total_frames * 1000:.0f} ms/frame), "
+          f"peak memory {mx.get_peak_memory() / 1e9:.1f} GB")
 
     # Save as numpy first (always works), then try MP4 if ffmpeg available
     arr = (np.asarray(video).transpose(0, 2, 3, 4, 1)[0] * 127.5 + 127.5).clip(0, 255).astype(np.uint8)
@@ -275,13 +388,23 @@ def main():
     np.save(str(npy_path), arr)
     print(f"\nSaved frames to {npy_path}  (shape {arr.shape})")
 
+    # The model's motion is 25 fps (PipelineConfig.target_fps); the driving audio
+    # is muxed in, cut to the clip's length.
+    fps = pipeline.config.target_fps
     try:
-        import imageio
+        import subprocess
 
-        writer = imageio.get_writer(str(args.out), fps=30, codec="libx264", quality=8)
-        for frame in arr:
-            writer.append_data(frame)
-        writer.close()
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-video_size", f"{arr.shape[2]}x{arr.shape[1]}", "-framerate", str(fps),
+            "-i", "pipe:0", "-i", str(audio_path),
+            "-t", f"{arr.shape[0] / fps:.6f}",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(args.out),
+        ]
+        subprocess.run(cmd, input=np.ascontiguousarray(arr).tobytes(), check=True)
         print(f"Saved MP4 to {args.out}")
     except Exception as e:
         print(f"(MP4 export skipped: {e})")

@@ -44,6 +44,13 @@ import mlx.core as mx
 import numpy as np
 
 
+# Upstream source repos. Avatar 1.6 keeps 1.5's architecture and ships a new
+# base DiT plus two distillation LoRAs (loraA = DMD, loraB = OPSD); the VAE,
+# umT5 and Whisper sources are unchanged.
+AVATAR_15_REPO = "meituan-longcat/LongCat-Video-Avatar-1.5"
+AVATAR_16_REPO = "meituan-longcat/LongCat-Video-Avatar-1.6"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -262,16 +269,14 @@ def convert_umt5(out_dir: pathlib.Path, dtype=mx.bfloat16) -> None:
     )
 
 
-def convert_whisper(out_dir: pathlib.Path, dtype=mx.bfloat16) -> None:
+def convert_whisper(out_dir: pathlib.Path, dtype=mx.bfloat16, source_repo: str = AVATAR_15_REPO) -> None:
     """meituan-longcat/LongCat-Video-Avatar-1.5/whisper-large-v3 → out_dir/audio_encoder/
 
     Only ENCODER keys are kept (decoder is unused for Avatar inference).
     """
     print(f"  Converting Whisper encoder → {out_dir}/audio_encoder/")
     # Whisper has a bf16 single file: `whisper-large-v3/model.safetensors`
-    src = _load_pt_safetensors(
-        "meituan-longcat/LongCat-Video-Avatar-1.5", "whisper-large-v3/model.safetensors"
-    )
+    src = _load_pt_safetensors(source_repo, "whisper-large-v3/model.safetensors")
     mlx_sd = {}
     for pt_k, v in src.items():
         if not pt_k.startswith("model.encoder."):
@@ -284,7 +289,7 @@ def convert_whisper(out_dir: pathlib.Path, dtype=mx.bfloat16) -> None:
         metadata={"format": "mlx", "source": "model.encoder"},
     )
     _copy_meituan_config(
-        "meituan-longcat/LongCat-Video-Avatar-1.5",
+        source_repo,
         "whisper-large-v3/config.json",
         out_dir / "audio_encoder" / "config.json",
     )
@@ -321,17 +326,16 @@ def _should_quantize_dit_linear(path: str, module) -> bool:
     return True
 
 
-def _write_dit_config_with_quant(out_dir: pathlib.Path, bits: int, group_size: int) -> None:
+def _write_dit_config_with_quant(
+    out_dir: pathlib.Path, bits: int, group_size: int, source_repo: str = AVATAR_15_REPO
+) -> None:
     """Copy Meituan's base_model/config.json then inject a `quantization`
     block so the runtime loader can apply `nn.quantize` before loading
     weights into the model.
     """
     from huggingface_hub import hf_hub_download
 
-    src = hf_hub_download(
-        repo_id="meituan-longcat/LongCat-Video-Avatar-1.5",
-        filename="base_model/config.json",
-    )
+    src = hf_hub_download(repo_id=source_repo, filename="base_model/config.json")
     cfg = json.loads(pathlib.Path(src).read_text())
     cfg["quantization"] = {
         "method": "mlx.nn.quantize",
@@ -349,8 +353,9 @@ def convert_dit(
     lora_to_merge: Optional[dict] = None,
     quantize_bits: Optional[int] = None,
     quantize_group_size: int = 64,
+    source_repo: str = AVATAR_15_REPO,
 ) -> None:
-    """meituan-longcat/LongCat-Video-Avatar-1.5/base_model → out_dir/dit/
+    """<source_repo>/base_model → out_dir/dit/
 
     Args:
         dtype: target dtype for non-quantized layers. Default bf16.
@@ -365,7 +370,7 @@ def convert_dit(
     qstr = f" [q{quantize_bits}]" if quantize_bits else ""
     print(f"  Converting Avatar DiT{qstr} → {out_dir}/dit/")
     src = _load_pt_safetensors_sharded(
-        "meituan-longcat/LongCat-Video-Avatar-1.5",
+        source_repo,
         "base_model/diffusion_pytorch_model.safetensors.index.json",
     )
     mlx_sd = {}
@@ -407,10 +412,7 @@ def convert_dit(
         # quantization block since this is the BF16 model we'll quantize from).
         from huggingface_hub import hf_hub_download
 
-        src_cfg_path = hf_hub_download(
-            repo_id="meituan-longcat/LongCat-Video-Avatar-1.5",
-            filename="base_model/config.json",
-        )
+        src_cfg_path = hf_hub_download(repo_id=source_repo, filename="base_model/config.json")
         base_cfg = json.loads(pathlib.Path(src_cfg_path).read_text())
         model = LongCatVideoAvatarTransformer3DModel.from_config(base_cfg)
 
@@ -433,15 +435,11 @@ def convert_dit(
 
         _save_sharded_safetensors(quantized_sd, out_dir / "dit", base_name="diffusion_pytorch_model")
         _write_dit_config_with_quant(
-            out_dir / "dit", bits=quantize_bits, group_size=quantize_group_size
+            out_dir / "dit", bits=quantize_bits, group_size=quantize_group_size, source_repo=source_repo
         )
     else:
         _save_sharded_safetensors(mlx_sd, out_dir / "dit", base_name="diffusion_pytorch_model")
-        _copy_meituan_config(
-            "meituan-longcat/LongCat-Video-Avatar-1.5",
-            "base_model/config.json",
-            out_dir / "dit" / "config.json",
-        )
+        _copy_meituan_config(source_repo, "base_model/config.json", out_dir / "dit" / "config.json")
 
 
 def convert_lora(out_dir: pathlib.Path) -> None:
@@ -459,11 +457,35 @@ def convert_lora(out_dir: pathlib.Path) -> None:
     )
 
 
-def copy_scheduler_and_tokenizer(out_dir: pathlib.Path) -> None:
+# Avatar 1.6: upstream's `loraA` is the DMD LoRA and `loraB` the OPSD LoRA
+# (model card, "Checkpoint composition and LoRA mixing"). Published under the
+# names the runtime uses.
+V16_LORAS: dict[str, str] = {
+    "loraA/lora.safetensors": "dmd_lora.safetensors",
+    "loraB/lora.safetensors": "opsd_lora.safetensors",
+}
+
+
+def convert_loras_v16(out_dir: pathlib.Path) -> None:
+    """Avatar 1.6's two distillation LoRAs → out_dir/lora/{dmd,opsd}_lora.safetensors.
+
+    Meituan-encoded names are preserved (decoded at runtime by
+    `lora.decode_module_name`); stored bf16, the dtype the side-path runs in
+    (PT casts each LoRA to the DiT's dtype in `enable_loras`). `alpha_scale`
+    stays fp32.
+    """
+    for src_name, dst_name in V16_LORAS.items():
+        print(f"  Converting {src_name} → {out_dir}/lora/{dst_name}")
+        src = _load_pt_safetensors(AVATAR_16_REPO, src_name)
+        out = {k: (v if k.endswith("alpha_scale") else v.astype(mx.bfloat16)) for k, v in src.items()}
+        _materialize_and_save(out, out_dir / "lora" / dst_name, metadata={"format": "mlx"})
+
+
+def copy_scheduler_and_tokenizer(out_dir: pathlib.Path, source_repo: str = AVATAR_15_REPO) -> None:
     """Copy scheduler config + umT5 tokenizer files verbatim from Meituan."""
     print(f"  Copying scheduler + tokenizer → {out_dir}/")
     _copy_meituan_config(
-        "meituan-longcat/LongCat-Video-Avatar-1.5",
+        source_repo,
         "scheduler/scheduler_config.json",
         out_dir / "scheduler" / "scheduler_config.json",
     )
@@ -735,17 +757,157 @@ def build_merged_variant(out_dir: pathlib.Path, *, skip_done: bool = True) -> No
     print(f"DONE: {out_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Avatar 1.6
+# ---------------------------------------------------------------------------
+
+
+def v16_variant_name(bits: Optional[int]) -> str:
+    return f"LongCat-Video-Avatar-1.6-{'bf16' if bits is None else f'q{bits}'}"
+
+
+def write_pipeline_config_v16(out_dir: pathlib.Path, bits: Optional[int]) -> None:
+    cfg = {
+        "model_version": "1.6",
+        "variant": "bf16" if bits is None else f"q{bits}",
+        "num_sampling_steps": 8,
+        "scheduler_shift": 7.0,
+        "text_guidance_scale": 1.0,  # distilled: no CFG (upstream --use_distill)
+        "audio_guidance_scale": 1.0,
+        "target_fps": 25,
+        "default_num_frames": 93,
+        "dit_class": "LongCatVideoAvatarTransformer3DModel",
+        "vae_class": "AutoencoderKLWan",
+        # Runtime LoRA schedule: steps < mix_steps run
+        # mix_alpha * DMD + (1 - mix_alpha) * OPSD, the rest OPSD only.
+        "lora": {
+            "mode": "runtime_mix",
+            "dmd": "lora/dmd_lora.safetensors",
+            "opsd": "lora/opsd_lora.safetensors",
+            "mix_steps": 4,
+            "mix_alpha": 1.0,
+        },
+        # Upstream skips loudness normalization of the driving audio for 1.6.
+        "audio_loudness_norm": False,
+    }
+    (out_dir / "pipeline_config.json").write_text(json.dumps(cfg, indent=2))
+
+
+def write_readme_v16(out_dir: pathlib.Path, bits: Optional[int]) -> None:
+    variant = "bf16" if bits is None else f"q{bits}"
+    quant_tags = "" if bits is None else f"  - quantized\n  - {bits}-bit\n"
+    dit_line = (
+        "bf16" if bits is None
+        else f"{bits}-bit (`mlx.nn.quantize`, `group_size=64`; `final_layer.linear`, the embedders and AdaLN stay unquantized)"
+    )
+    readme = f"""---
+license: mit
+library_name: mlx
+pipeline_tag: image-to-video
+tags:
+  - mlx
+  - apple-silicon
+  - video-generation
+  - audio-driven-video
+  - avatar
+  - longcat
+  - distilled
+{quant_tags}base_model:
+  - meituan-longcat/LongCat-Video-Avatar-1.6
+language:
+  - en
+  - zh
+---
+
+# {out_dir.name} (MLX)
+
+Apple MLX conversion of [meituan-longcat/LongCat-Video-Avatar-1.6](https://huggingface.co/meituan-longcat/LongCat-Video-Avatar-1.6):
+audio-driven talking-avatar video from a reference image, speech and a prompt.
+
+| | |
+|---|---|
+| **DiT** (`dit/`) | {dit_line}; the 1.6 base model, no LoRA merged |
+| **LoRAs** (`lora/`) | `dmd_lora.safetensors` (upstream `loraA`) and `opsd_lora.safetensors` (upstream `loraB`), bf16 |
+| **umT5 / Whisper encoder / VAE** | bf16, same sources as the 1.5 conversions |
+| **Sampling** | 8 steps; steps 1-4 run the DMD LoRA, steps 5-8 the OPSD LoRA (upstream's `--mix_steps=4 --mix_alpha=1.0`) |
+| **License** | MIT |
+
+Avatar 1.6 switches LoRA part-way through the denoise, so neither LoRA is
+merged into the DiT: both run as side-paths (`base(x) + up(down(x)) * scale`)
+and the pipeline changes which one is active per step. `pipeline_config.json`
+carries the schedule.
+
+## Use
+
+Python: [xocialize/longcat-avatar-mlx](https://github.com/xocialize/longcat-avatar-mlx)
+
+```bash
+hf download mlx-community/{out_dir.name} --local-dir ./weights/{out_dir.name}
+.venv/bin/python scripts/run_inference.py --weights ./weights --variant v1.6-{variant} --out output.mp4
+```
+
+Swift: [xocialize/longcat-avatar-mlx-swift](https://github.com/xocialize/longcat-avatar-mlx-swift)
+
+## Source
+
+Converted with [`recipes/convert_longcat_avatar.py`](https://github.com/xocialize/longcat-avatar-mlx/blob/main/recipes/convert_longcat_avatar.py)
+(`--variant v1.6-{variant}`).
+"""
+    (out_dir / "README.md").write_text(readme)
+
+
+def build_v16_variant(
+    out_dir: pathlib.Path, *, bits: Optional[int] = None, group_size: int = 64, skip_done: bool = True
+) -> None:
+    """Build `LongCat-Video-Avatar-1.6-{bf16,q8,q4}`: the 1.6 base DiT
+    (optionally quantized), both LoRAs unmerged, and the shared encoders/VAE.
+    """
+    print(f"Building Avatar 1.6 {'bf16' if bits is None else f'q{bits}'} variant → {out_dir}")
+    if skip_done and _component_done(out_dir, "vae", "diffusion_pytorch_model.safetensors"):
+        print("  VAE already converted — skipping")
+    else:
+        convert_vae(out_dir)
+    if skip_done and _component_done(out_dir, "text_encoder", "model.safetensors.index.json"):
+        print("  umT5 already converted — skipping")
+    else:
+        convert_umt5(out_dir)
+    if skip_done and _component_done(out_dir, "audio_encoder", "model.safetensors"):
+        print("  Whisper encoder already converted — skipping")
+    else:
+        convert_whisper(out_dir, source_repo=AVATAR_16_REPO)
+    if skip_done and _component_done(out_dir, "dit", "diffusion_pytorch_model.safetensors.index.json"):
+        print("  DiT already converted — skipping")
+    else:
+        convert_dit(
+            out_dir,
+            lora_to_merge=None,
+            quantize_bits=bits,
+            quantize_group_size=group_size,
+            source_repo=AVATAR_16_REPO,
+        )
+    if skip_done and all(_component_done(out_dir, "lora", n) for n in V16_LORAS.values()):
+        print("  LoRAs already converted — skipping")
+    else:
+        convert_loras_v16(out_dir)
+    copy_scheduler_and_tokenizer(out_dir, source_repo=AVATAR_16_REPO)
+    write_pipeline_config_v16(out_dir, bits)
+    write_readme_v16(out_dir, bits)
+    print(f"DONE: {out_dir}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Convert LongCat-Video-Avatar-1.5 to MLX format")
+    parser = argparse.ArgumentParser(description="Convert LongCat-Video-Avatar 1.5 / 1.6 to MLX format")
     parser.add_argument(
         "--variant",
-        choices=("base", "merged", "both", "q4-merged", "q8-merged"),
+        choices=("base", "merged", "both", "q4-merged", "q8-merged", "v1.6-bf16", "v1.6-q8", "v1.6-q4"),
         default="both",
         help=(
             "Which variant(s) to produce. "
             "`base`/`merged`/`both`: bf16 variants (with separate LoRA / pre-merged / both). "
             "`q4-merged`/`q8-merged`: quantized DiT (Linears only, skipping final_layer / "
-            "embedders / AdaLN) on top of the pre-merged DMD weights."
+            "embedders / AdaLN) on top of the pre-merged DMD weights. "
+            "`v1.6-*`: Avatar 1.6 — base DiT (bf16 or quantized) plus the unmerged DMD and "
+            "OPSD LoRAs, switched at runtime."
         ),
     )
     parser.add_argument(
@@ -768,6 +930,9 @@ def main():
         build_quantized_merged_variant(
             args.out / "LongCat-Video-Avatar-1.5-q8-dmd-merged", bits=8
         )
+    if args.variant.startswith("v1.6-"):
+        bits = {"bf16": None, "q8": 8, "q4": 4}[args.variant.split("-", 1)[1]]
+        build_v16_variant(args.out / v16_variant_name(bits), bits=bits)
 
 
 if __name__ == "__main__":

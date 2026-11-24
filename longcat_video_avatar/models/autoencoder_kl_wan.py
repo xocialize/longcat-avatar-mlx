@@ -691,12 +691,14 @@ class AutoencoderKLWan(nn.Module):
         t = x.shape[2]
         num_chunks = 1 + (t - 1) // 4
 
-        out = None
+        chunks = []
         for i in range(num_chunks):
             feat_idx = [0]
             chunk = x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
             chunk_out = self.encoder(chunk, feat_cache=feat_cache, feat_idx=feat_idx)
-            out = chunk_out if out is None else mx.concatenate([out, chunk_out], axis=2)
+            mx.eval(chunk_out)  # materialize per chunk (see `decode`)
+            chunks.append(chunk_out)
+        out = chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=2)
 
         mu, _ = mx.split(self.quant_conv(out), 2, axis=1)
         return mu
@@ -727,11 +729,16 @@ class AutoencoderKLWan(nn.Module):
         feat_cache: list = [None] * num_slots
 
         num_frame = x.shape[2]
-        out: mx.array | None = None
+        chunks = []
         for i in range(num_frame):
             feat_idx = [0]
             chunk = x[:, :, i : i + 1]
-            chunk_out = self.decoder(chunk, feat_cache=feat_cache, feat_idx=feat_idx)
-            out = chunk_out if out is None else mx.concatenate([out, chunk_out], axis=2)
+            chunk_out = mx.clip(self.decoder(chunk, feat_cache=feat_cache, feat_idx=feat_idx), -1, 1)
+            # Materialize per latent frame. Left lazy, the graph spans every
+            # frame and is evaluated in one go, with all frames' full-resolution
+            # feature maps live together (Swift measured +38 GB over the
+            # resident set for 93 frames at 768x512).
+            mx.eval(chunk_out)
+            chunks.append(chunk_out)
 
-        return mx.clip(out, -1, 1)
+        return chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=2)

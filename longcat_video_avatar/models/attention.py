@@ -51,11 +51,32 @@ class Attention(nn.Module):
 
         self.rope_3d = RotaryPositionalEmbedding(self.head_dim)
 
+    # Dense attention materializes the score matrix `[B, H, S_q, S_k]`. A 93-frame
+    # 480p clip is ~37,000 tokens: 32 heads x 37,000^2 bf16 scores is ~87 GB in
+    # one array. PT avoids it with flash attention; here the queries are
+    # processed in slices whose scores stay under this many bytes. Rows of an
+    # attention matrix are independent, so the result is the same.
+    ATTN_SCORE_BUDGET_BYTES = 4 * 1024**3
+
     def _process_attn(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
-        """Dense SDPA wrapper. PT version branches over flash/bsa/xformers — we
-        only have dense on Metal. q/k/v: [B, H, S, D]. Returns [B, H, S_q, D].
+        """Dense SDPA, query-sliced when the score matrix would pass
+        `ATTN_SCORE_BUDGET_BYTES`. PT branches over flash/bsa/xformers — we only
+        have dense on Metal. q/k/v: [B, H, S, D]. Returns [B, H, S_q, D].
         """
-        return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        B, H, S_q, _ = q.shape
+        S_k = k.shape[2]
+        row_bytes = B * H * S_k * q.dtype.size
+        if row_bytes * S_q <= self.ATTN_SCORE_BUDGET_BYTES:
+            return mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        rows = max(1, self.ATTN_SCORE_BUDGET_BYTES // row_bytes)
+        mx.eval(q, k, v)
+        parts = []
+        for start in range(0, S_q, rows):
+            part = mx.fast.scaled_dot_product_attention(q[:, :, start : start + rows], k, v, scale=self.scale)
+            # Evaluate now: a lazy graph may otherwise hold several slices' scores at once.
+            mx.eval(part)
+            parts.append(part)
+        return mx.concatenate(parts, axis=2)
 
     def __call__(
         self,

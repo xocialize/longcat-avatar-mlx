@@ -155,3 +155,54 @@ def build_avatar_audio_embeddings(
         windows.append(padded[:, offset : offset + target_len])  # [B, T_video, G, D]
     # Stack along the window axis -> [B, T_video, W, G, D]
     return mx.stack(windows, axis=2)
+
+
+def build_frame_audio_features(
+    audio_groups: mx.array,
+    fps: int = 25,
+    enc_fps: int = 50,
+    video_length: Optional[int] = None,
+) -> mx.array:
+    """Encoder-rate group features → one feature per video frame, as PT
+    `get_audio_embedding_whisper` does it: keep the first `video_length * 2`
+    encoder frames (the audio's real extent; the feature extractor pads every
+    chunk to 30 s), then interpolate to `video_length` with align-corners.
+
+    Args:
+        audio_groups: [1, T_enc, 5, D].
+        video_length: `int(audio_seconds * fps)`; defaults to the whole of `audio_groups`.
+
+    Returns: [T_video, 5, D].
+    """
+    B, T_enc, G, D = audio_groups.shape
+    assert B == 1, "one driving audio per call"
+    if video_length is None:
+        video_length = int(T_enc / enc_fps * fps)
+    valid = audio_groups[:, : video_length * (enc_fps // fps)]
+    flat = valid.reshape(1, valid.shape[1], G * D)
+    resampled = linear_interpolate_features(
+        flat, input_fps=float(enc_fps), output_fps=float(fps), output_len=video_length
+    )
+    return resampled.reshape(video_length, G, D)
+
+
+def window_audio_features(
+    frame_features: mx.array,
+    start: int,
+    num_frames: int,
+    audio_window: int = 5,
+) -> mx.array:
+    """The DiT's `audio_embs` for `num_frames` video frames starting at frame
+    `start`: each frame takes the `audio_window` features centred on it, indices
+    clamped to the audio's extent (PT `center_indices` in the demo script).
+
+    Args:
+        frame_features: [T_video, 5, D] from `build_frame_audio_features`.
+
+    Returns: [1, num_frames, W=audio_window, 5, D].
+    """
+    T = frame_features.shape[0]
+    half = audio_window // 2
+    centers = mx.arange(start, start + num_frames)[:, None] + mx.arange(-half, half + 1)[None, :]
+    centers = mx.clip(centers, 0, T - 1)
+    return frame_features[centers][None]

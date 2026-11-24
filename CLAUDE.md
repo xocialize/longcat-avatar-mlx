@@ -4,9 +4,15 @@ Operational orientation for Claude when working in this repo.
 
 ## What this is
 
-MLX port of [LongCat-Video-Avatar-1.5](https://github.com/meituan-longcat/LongCat-Video).
-Meituan's audio-driven video diffusion model on Apple Silicon (13.6B-param
-DiT + Wan VAE + umT5-XXL + Whisper-Large-v3 + DMD step-distillation LoRA).
+MLX port of [LongCat-Video-Avatar](https://github.com/meituan-longcat/LongCat-Video),
+currently 1.6 (1.5 variants still load). Meituan's audio-driven video diffusion model on
+Apple Silicon (13.6B-param DiT + Wan VAE + umT5-XXL + Whisper-Large-v3 + distillation LoRAs:
+one merged DMD LoRA in 1.5; DMD and OPSD switched mid-denoise as runtime side-paths in 1.6).
+
+The pipeline (`pipeline_mlx.py`) mirrors upstream's `generate_ai2v` / `generate_avc` method
+for method. When it and `refs/longcat-video/longcat_video/pipeline_longcat_video_avatar.py`
+or `run_demo_avatar_single_audio_to_video.py` disagree, upstream wins: the README's
+"Corrections to the 1.5 pipeline" table lists what drifted once already.
 
 ## Where things live
 
@@ -34,6 +40,7 @@ DiT + Wan VAE + umT5-XXL + Whisper-Large-v3 + DMD step-distillation LoRA).
 
 ```bash
 .venv/bin/python -m pytest tests/smoke -v          # always green, no weights
+PYTHONPATH=. .venv/bin/python scripts/run_inference.py ...   # the package is not pip-installed in .venv
 LONGCAT_VAE_AUTO_DOWNLOAD=1 \
   .venv/bin/python -m pytest tests/parity -v        # PT parity, needs [parity] extras
 ```
